@@ -229,7 +229,7 @@ impl NavigationDisplayRenderer {
             self.rendering_data.last_frame = None;
             self.rendering_data.final_frame = None;
             self.rendering_data.current_frame = None;
-            
+
             // Set explicit flag to trigger immediate new cycle
             self.rendering_data.needs_immediate_render = true;
 
@@ -300,7 +300,7 @@ impl NavigationDisplayRenderer {
         // Store the frame dimensions
         self.rendering_data.frame_width = frame_width;
         self.rendering_data.frame_height = frame_height;
-        
+
         // Clear the immediate render flag since we're starting a new cycle
         self.rendering_data.needs_immediate_render = false;
 
@@ -410,6 +410,9 @@ impl NavigationDisplayRenderer {
         // Advance transition by angular step
         self.rendering_data.current_transition_border += RENDERING_MAP_TRANSITION_ANGULAR_STEP;
 
+        // Get the center offset for correct aircraft position (0 for arc mode, 342 for rose mode)
+        let center_offset_y = self.configuration.center_offset_y.unwrap_or(0) as usize;
+
         if self.rendering_data.current_transition_border < 90 {
             // Still transitioning
             self.rendering_data.current_frame = Some(self.arc_mode_transition_frame(
@@ -419,6 +422,7 @@ impl NavigationDisplayRenderer {
                 self.rendering_data.current_transition_border,
                 map_width,
                 map_height,
+                center_offset_y,
             ));
             return false;
         }
@@ -433,6 +437,7 @@ impl NavigationDisplayRenderer {
                 90,
                 map_width,
                 map_height,
+                center_offset_y,
             ));
         }
 
@@ -455,6 +460,7 @@ impl NavigationDisplayRenderer {
         end_angle: i32,
         map_width: usize,
         map_height: usize,
+        center_offset_y: usize,
     ) -> Vec<u8> {
         let frame_size = map_width * RENDERING_COLOR_CHANNEL_COUNT * map_height;
         let mut result = vec![0u8; frame_size];
@@ -473,13 +479,14 @@ impl NavigationDisplayRenderer {
         };
 
         let half_width = map_width as f64 / 2.0;
-        let height_f = map_height as f64;
+        // Aircraft center is at map_height - center_offset_y (bottom for arc mode, center for rose mode)
+        let aircraft_y = (map_height - center_offset_y) as f64;
 
         let mut array_index = 0;
         for y in 0..map_height {
             for x in 0..map_width {
                 let dx = x as f64 - half_width;
-                let dy = height_f - y as f64;
+                let dy = aircraft_y - y as f64;
                 let distance = (dx * dx + dy * dy).sqrt();
 
                 // Calculate angle in degrees (0° = straight ahead, 90° = sides)
