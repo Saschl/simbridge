@@ -59,6 +59,8 @@ struct NavigationDisplayRenderingData {
     frame_width: usize,
     /// Frame height in pixels (set when final_frame is set)
     frame_height: usize,
+    /// Flag set when config changes and immediate re-render is needed
+    needs_immediate_render: bool,
 }
 
 impl NavigationDisplayRenderer {
@@ -77,6 +79,7 @@ impl NavigationDisplayRenderer {
                 frame_validity_duration: RENDERING_MAP_FRAME_VALIDITY_TIME_ARC_MODE,
                 frame_width: 0,
                 frame_height: 0,
+                needs_immediate_render: true, // Start with needing a render
             },
             aircraft_status: None,
             rendering_mode: TerrainRenderingMode::ArcMode,
@@ -106,6 +109,7 @@ impl NavigationDisplayRenderer {
             frame_validity_duration: self.rendering_data.frame_validity_duration,
             frame_width: 0,
             frame_height: 0,
+            needs_immediate_render: false,
         };
     }
 
@@ -219,14 +223,17 @@ impl NavigationDisplayRenderer {
                 display_mode: 0,
                 frame_byte_count: 0,
             };
-            
+
             // Clear last_frame so the transition shows only the new rendered area
             // (no old data to blend with - like TypeScript behavior on range change)
             self.rendering_data.last_frame = None;
             self.rendering_data.final_frame = None;
             self.rendering_data.current_frame = None;
             
-            log::debug!("Config changed - cleared frames for fresh transition");
+            // Set explicit flag to trigger immediate new cycle
+            self.rendering_data.needs_immediate_render = true;
+
+            log::debug!("Config changed - cleared frames for fresh transition, needs_immediate_render=true");
         }
 
         self.configuration = config;
@@ -259,8 +266,13 @@ impl NavigationDisplayRenderer {
 
     /// Check if a new render cycle is needed (config changed, frames invalidated)
     pub fn needs_new_cycle(&self) -> bool {
-        // If we have no final_frame (cleared after config change), we need a new cycle
-        self.rendering_data.final_frame.is_none()
+        // Explicit flag set when config changes (range, mode, etc.)
+        self.rendering_data.needs_immediate_render
+    }
+
+    /// Clear the needs_immediate_render flag (called when cycle starts)
+    pub fn clear_needs_immediate_render(&mut self) {
+        self.rendering_data.needs_immediate_render = false;
     }
 
     /// Set the final (fully rendered) frame for transition
@@ -288,6 +300,9 @@ impl NavigationDisplayRenderer {
         // Store the frame dimensions
         self.rendering_data.frame_width = frame_width;
         self.rendering_data.frame_height = frame_height;
+        
+        // Clear the immediate render flag since we're starting a new cycle
+        self.rendering_data.needs_immediate_render = false;
 
         let map_height = frame_height as u32;
 
