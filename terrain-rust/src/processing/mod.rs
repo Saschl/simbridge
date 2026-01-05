@@ -9,7 +9,7 @@
 mod renderer;
 mod patterns;
 
-use patterns::{get_arc_mode_pattern_value, draw_density_pixel, ARC_MODE_PATTERN_WIDTH, ARC_MODE_PATTERN_HEIGHT};
+use patterns::{get_pattern_value, draw_density_pixel, ARC_MODE_PATTERN_WIDTH, ARC_MODE_PATTERN_HEIGHT, SCANLINE_MODE_PATTERN_WIDTH, SCANLINE_MODE_PATTERN_HEIGHT};
 
 use std::path::Path;
 use std::time::Instant;
@@ -1153,10 +1153,11 @@ impl TerrainProcessor {
             return true; // Solid
         }
 
-        // Get pattern value from the arc mode pattern map
-        // The TypeScript uses: patternValue = patternMap[this.thread.y][pixelX]
-        // And: if (Math.round(patternValue % patternIndex) === 0) { draw } else { transparent }
-        let pattern_value = get_arc_mode_pattern_value(x, y);
+        // Get pattern value based on rendering mode:
+        // - ScanlineMode (A380X): use scanline pattern (592 height)
+        // - ArcMode (A32NX): use arc pattern (492 height)
+        let use_scanline_mode = self.rendering_mode == TerrainRenderingMode::ScanlineMode;
+        let pattern_value = get_pattern_value(x, y, use_scanline_mode);
 
         // Use the exact TypeScript logic: drawDensityPixel
         draw_density_pixel(pattern_value, pattern_index)

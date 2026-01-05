@@ -1,14 +1,18 @@
 //! Pattern generation for terrain display rendering
 //!
-//! Uses the pre-computed arc mode pattern map from TypeScript
+//! Uses pre-computed pattern maps from TypeScript:
+//! - Arc mode pattern (768x492) for A32NX
+//! - Scanline mode pattern (768x592) for A380X
 
 #![allow(dead_code)]
 
 mod pattern_data;
+mod scanline_pattern_data;
 
 pub use pattern_data::{ARC_MODE_PATTERN_MAP, ARC_MODE_PATTERN_WIDTH, ARC_MODE_PATTERN_HEIGHT};
+pub use scanline_pattern_data::{SCANLINE_MODE_PATTERN_MAP, SCANLINE_MODE_PATTERN_WIDTH, SCANLINE_MODE_PATTERN_HEIGHT};
 
-/// Get pattern value at (x, y) from the arc mode pattern map
+/// Get pattern value at (x, y) from the arc mode pattern map (A32NX)
 /// Returns 0 if out of bounds (transparent)
 #[inline]
 pub fn get_arc_mode_pattern_value(x: usize, y: usize) -> u8 {
@@ -20,6 +24,33 @@ pub fn get_arc_mode_pattern_value(x: usize, y: usize) -> u8 {
         ARC_MODE_PATTERN_MAP[idx]
     } else {
         0
+    }
+}
+
+/// Get pattern value at (x, y) from the scanline mode pattern map (A380X)
+/// Returns 0 if out of bounds (transparent)
+#[inline]
+pub fn get_scanline_mode_pattern_value(x: usize, y: usize) -> u8 {
+    if y >= SCANLINE_MODE_PATTERN_HEIGHT || x >= SCANLINE_MODE_PATTERN_WIDTH {
+        return 0;
+    }
+    let idx = y * SCANLINE_MODE_PATTERN_WIDTH + x;
+    if idx < SCANLINE_MODE_PATTERN_MAP.len() {
+        SCANLINE_MODE_PATTERN_MAP[idx]
+    } else {
+        0
+    }
+}
+
+/// Get pattern value based on rendering mode
+/// - use_scanline_mode = true: A380X (592 height pattern)
+/// - use_scanline_mode = false: A32NX (492 height pattern)
+#[inline]
+pub fn get_pattern_value(x: usize, y: usize, use_scanline_mode: bool) -> u8 {
+    if use_scanline_mode {
+        get_scanline_mode_pattern_value(x, y)
+    } else {
+        get_arc_mode_pattern_value(x, y)
     }
 }
 
