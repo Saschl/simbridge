@@ -1,0 +1,48 @@
+[package]
+name = "simbridge-terrain"
+version = "0.1.0"
+edition = "2021"
+description = "Terrain rendering service for SimBridge - Rust implementation"
+authors = ["FlyByWire Simulations"]
+
+[dependencies]
+# Web framework
+actix-web = "4"
+actix-rt = "2"
+actix-cors = "0.7"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SimConnect bindings - using FlyByWire's msfs-rs
+# This crate supports both WASM gauges and external applications
+msfs = { git = "https://github.com/flybywiresim/msfs-rs", branch = "main" }
+
+# Compression for terrain tiles
+flate2 = "1"
+
+# Image processing
+image = "0.24"
+png = "0.17"
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Base64 encoding for frame data
+base64 = "0.21"
+
+# Math utilities
+num-traits = "0.2"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true

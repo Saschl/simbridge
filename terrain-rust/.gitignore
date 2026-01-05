@@ -1,0 +1,22 @@
+# Rust specific ignores
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Debug files
+*.pdb
+
+# OS specific
+.DS_Store
+Thumbs.db
