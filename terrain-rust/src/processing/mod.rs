@@ -1704,7 +1704,7 @@ impl TerrainProcessor {
             let current_time = Instant::now();
             state.vertical_display.start_new_map_cycle(current_time);
             state.vertical_display.set_final_frame(final_frame);
-            debug!("Started VD transition cycle for {:?} with dimensions {}x{}", 
+            debug!("Started VD transition cycle for {:?} with dimensions {}x{}",
                 side, RENDERING_ELEVATION_PROFILE_WIDTH, RENDERING_ELEVATION_PROFILE_HEIGHT);
         }
     }

@@ -297,18 +297,20 @@ impl NavigationDisplayRenderer {
     /// - For first frame: Calculate based on time since startup
     /// - For subsequent frames: Start from beginning (0 for arc, mapHeight for scanline)
     pub fn start_new_map_cycle(&mut self, current_time: Instant, frame_width: usize, frame_height: usize) {
-        // Store the frame dimensions
+        // Store the frame dimensions (for the actual pixel buffer)
         self.rendering_data.frame_width = frame_width;
         self.rendering_data.frame_height = frame_height;
 
         // Clear the immediate render flag since we're starting a new cycle
         self.rendering_data.needs_immediate_render = false;
 
-        let map_height = frame_height as u32;
+        // Use MAP height from configuration for transition calculations
+        // This matches TypeScript: this.configuration.mapHeight
+        let map_height = self.configuration.map_height.unwrap_or(frame_height as u32);
 
         log::debug!(
-            "start_new_map_cycle: dims={}x{}, last_frame={}, nd_range={}",
-            frame_width, frame_height,
+            "start_new_map_cycle: frame={}x{}, map_height={}, last_frame={}, nd_range={}",
+            frame_width, frame_height, map_height,
             self.rendering_data.last_frame.as_ref().map(|f| f.len()).unwrap_or(0),
             self.configuration.nd_range
         );
@@ -326,7 +328,7 @@ impl NavigationDisplayRenderer {
             let ratio_since_last_frame = frame_update_count - frame_update_count.floor();
 
             if self.rendering_mode == TerrainRenderingMode::ScanlineMode {
-                // Scanline mode: start from height, transition downward
+                // Scanline mode: start from map_height, transition downward
                 self.rendering_data.start_transition_border =
                     map_height as i32 - (map_height as f64 * ratio_since_last_frame).floor() as i32;
             } else {
@@ -525,12 +527,16 @@ impl NavigationDisplayRenderer {
             None => return true,
         };
 
-        // Use dimensions stored when frame was set (from actual rendered frame)
-        let map_width = self.rendering_data.frame_width;
-        let map_height = self.rendering_data.frame_height;
+        // Use FRAME dimensions for the actual pixel buffer
+        let frame_width = self.rendering_data.frame_width;
+        let frame_height = self.rendering_data.frame_height;
+
+        // Use MAP dimensions from configuration for transition calculation
+        // This is what TypeScript uses: this.configuration.mapHeight
+        let map_height = self.configuration.map_height.unwrap_or(frame_height as u32) as usize;
 
         // Verify dimensions are valid
-        if map_width == 0 || map_height == 0 {
+        if frame_width == 0 || frame_height == 0 || map_height == 0 {
             log::warn!("Frame dimensions not set for scanline. Skipping transition.");
             self.rendering_data.current_frame = Some(final_frame.clone());
             self.rendering_data.last_frame = self.rendering_data.current_frame.clone();
@@ -538,11 +544,11 @@ impl NavigationDisplayRenderer {
         }
 
         // Verify the frame size matches expected dimensions
-        let expected_size = map_width * map_height * RENDERING_COLOR_CHANNEL_COUNT;
+        let expected_size = frame_width * frame_height * RENDERING_COLOR_CHANNEL_COUNT;
         if final_frame.len() != expected_size {
             log::warn!(
                 "Frame size mismatch in scanline: expected {} ({}x{}x4), got {}. Skipping transition.",
-                expected_size, map_width, map_height, final_frame.len()
+                expected_size, frame_width, frame_height, final_frame.len()
             );
             // Just return the final frame as-is
             self.rendering_data.current_frame = Some(final_frame.clone());
@@ -550,7 +556,8 @@ impl NavigationDisplayRenderer {
             return true;
         }
 
-        // Calculate vertical step per tick
+        // Calculate vertical step per tick using MAP height (not frame height)
+        // This matches TypeScript: (this.configuration.mapHeight / duration) * deltaTime
         let vertical_step = ((map_height as f64 / RENDERING_MAP_TRANSITION_DURATION_SCANLINE_MODE as f64)
             * RENDERING_MAP_TRANSITION_DELTA_TIME as f64)
             .round() as i32;
@@ -566,8 +573,8 @@ impl NavigationDisplayRenderer {
             self.rendering_data.current_frame = Some(self.scanline_mode_transition_frame(
                 self.rendering_data.last_frame.as_ref(),
                 self.rendering_data.final_frame.as_ref().unwrap(),
-                map_width,
-                map_height,
+                frame_width,
+                frame_height,
             ));
             return false;
         }
@@ -577,8 +584,8 @@ impl NavigationDisplayRenderer {
             self.rendering_data.current_frame = Some(self.scanline_mode_transition_frame(
                 self.rendering_data.last_frame.as_ref(),
                 self.rendering_data.final_frame.as_ref().unwrap(),
-                map_width,
-                map_height,
+                frame_width,
+                frame_height,
             ));
         }
 

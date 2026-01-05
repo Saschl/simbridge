@@ -439,10 +439,10 @@ impl SimConnectHandler {
             if let Ok(mut processor) = self.terrain_processor.write() {
                 let nd_complete = processor.tick_transition(side);
                 let vd_complete = processor.tick_vd_transition(side);
-                
+
                 // Get ND frame
                 let mut frame = processor.get_current_transition_frame(side);
-                
+
                 // If VD is enabled, composite VD onto ND frame
                 if processor.should_render_vd(side) {
                     if let Some(vd_frame) = processor.get_current_vd_transition_frame(side) {
@@ -454,7 +454,7 @@ impl SimConnectHandler {
                         }
                     }
                 }
-                
+
                 // Transition complete when both ND and VD are done
                 (nd_complete && vd_complete, frame)
             } else {
