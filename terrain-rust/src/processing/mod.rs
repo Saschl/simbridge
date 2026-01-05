@@ -355,8 +355,11 @@ impl TerrainProcessor {
             &status.efis_data_fo
         };
 
+        // Check if this is startup (first update)
+        let startup = self.aircraft_status.is_none();
+
         if let Some(state) = self.display_rendering.get_mut(&side) {
-            state.navigation_display.aircraft_status_update(status.clone(), side);
+            state.navigation_display.aircraft_status_update(status.clone(), side, startup);
             state.vertical_display.aircraft_status_update(status.clone(), side);
         }
     }
@@ -456,11 +459,13 @@ impl TerrainProcessor {
     }
 
     /// Render navigation display frame and return (frame_data, min_for_display, max_for_display, is_normal_mode)
-    fn render_navigation_display_frame_with_stats(&mut self, side: DisplaySide) -> Option<(Vec<u8>, i32, i32, bool)> {
+    /// Render raw RGBA frame with elevation stats (no PNG encoding)
+    /// Returns (raw_rgba_frame, min_elevation, max_elevation, is_normal_mode, width, height)
+    fn render_raw_frame_with_stats(&mut self, side: DisplaySide) -> Option<(Vec<u8>, i32, i32, bool, usize, usize)> {
         let state = self.display_rendering.get(&side)?;
         let config = state.navigation_display.display_configuration();
 
-        debug!("render_navigation_display_frame_with_stats({:?}): terr_on_nd={}, terr_on_vd={}, nd_range={}",
+        debug!("render_raw_frame_with_stats({:?}): terr_on_nd={}, terr_on_vd={}, nd_range={}",
             side, config.terr_on_nd, config.terr_on_vd, config.nd_range);
 
         if !config.terr_on_nd && !config.terr_on_vd {
@@ -475,7 +480,7 @@ impl TerrainProcessor {
                 return None;
             }
         };
-        let cached_data = match self.cached_elevation_data.as_ref() {
+        let _cached_data = match self.cached_elevation_data.as_ref() {
             Some(d) => d,
             None => {
                 warn!("No cached elevation data available for rendering {:?}", side);
@@ -517,6 +522,13 @@ impl TerrainProcessor {
         } else {
             (0, 0, false)
         };
+
+        Some((frame, min_elev, max_elev, is_normal_mode, display_width, display_height))
+    }
+
+    fn render_navigation_display_frame_with_stats(&mut self, side: DisplaySide) -> Option<(Vec<u8>, i32, i32, bool)> {
+        let (frame, min_elev, max_elev, is_normal_mode, display_width, display_height) =
+            self.render_raw_frame_with_stats(side)?;
 
         // Encode to PNG
         match self.encode_frame_to_png(&frame, display_width, display_height) {
@@ -611,7 +623,7 @@ impl TerrainProcessor {
         }
 
         let config = self.display_rendering.get(&side)
-            .map(|s| s.navigation_display.display_configuration())
+            .map(|s| s.navigation_display.display_configuration().clone())
             .unwrap_or_default();
 
         let offset_x = config.map_offset_x.unwrap_or(0) as usize;
@@ -1023,19 +1035,19 @@ impl TerrainProcessor {
         // - is_normal_mode: whether we're in normal or peaks mode
         //
         // TypeScript uses histogram binning with 100ft bins starting at -500ft:
-        // - minElevation = bin * 100 - 500 (floor to bin boundary)  
+        // - minElevation = bin * 100 - 500 (floor to bin boundary)
         // - maxElevation = (bin + 1) * 100 - 500 (ceil to next bin boundary)
         let min_raw = if thresholds.cutoff_altitude > thresholds.low_density_green {
             thresholds.cutoff_altitude
         } else {
             thresholds.low_density_green
         };
-        
+
         // Bin to histogram boundaries like TypeScript
         // min: floor to bin boundary
         let min_bin = (min_raw - HISTOGRAM_MINIMUM_ELEVATION) / HISTOGRAM_BIN_RANGE;
         let min_for_display = min_bin * HISTOGRAM_BIN_RANGE + HISTOGRAM_MINIMUM_ELEVATION;
-        
+
         // max: ceil to next bin boundary (bin + 1)
         let max_bin = (thresholds.max_elevation - HISTOGRAM_MINIMUM_ELEVATION) / HISTOGRAM_BIN_RANGE;
         let max_for_display = (max_bin + 1) * HISTOGRAM_BIN_RANGE + HISTOGRAM_MINIMUM_ELEVATION;
@@ -1166,6 +1178,122 @@ impl TerrainProcessor {
         Ok(output)
     }
 
+    /// Public method to encode a raw RGBA frame to PNG
+    /// Used by SimConnect handler to encode transition frames before sending
+    pub fn encode_to_png(&self, frame: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+        self.encode_frame_to_png(frame, width, height).ok()
+    }
+
+    /// Get the current display dimensions
+    pub fn get_display_dimensions(&self) -> (usize, usize) {
+        let display_width = NAVIGATION_DISPLAY_MAX_PIXEL_WIDTH;
+        let display_height = if self.vertical_display_required {
+            DISPLAY_SCREEN_PIXEL_HEIGHT_WITH_VERTICAL_DISPLAY
+        } else {
+            DISPLAY_SCREEN_PIXEL_HEIGHT_WITHOUT_VERTICAL_DISPLAY
+        };
+        (display_width, display_height)
+    }
+
+    /// Render a raw RGBA navigation display frame for use in transitions
+    /// Returns (metadata, raw_rgba_frame, width, height)
+    /// The frame_byte_count in metadata is set to raw frame size; caller should update after PNG encoding
+    pub fn render_raw_frame_for_transition(&mut self, side: DisplaySide) -> Option<(crate::types::NavigationDisplayData, Vec<u8>, usize, usize)> {
+        if !self.initialized {
+            debug!("render_raw_frame_for_transition: not initialized");
+            return None;
+        }
+
+        // Check if terrain display is enabled
+        {
+            let state = match self.display_rendering.get(&side) {
+                Some(s) => s,
+                None => {
+                    warn!("No display rendering state for {:?}", side);
+                    return None;
+                }
+            };
+            let nd_config = state.navigation_display.display_configuration();
+
+            if !nd_config.terr_on_nd && !nd_config.terr_on_vd {
+                debug!("Terrain display not enabled for {:?}", side);
+                return None;
+            }
+        }
+
+        // Render raw RGBA frame
+        let (frame, min_for_display, max_for_display, is_normal_mode, width, height) =
+            self.render_raw_frame_with_stats(side)?;
+
+        // Calculate elevation modes
+        let (min_mode, max_mode) = {
+            let status = self.aircraft_status.as_ref()?;
+            let gear_offset = if status.gear_is_down { 250 } else { 500 };
+
+            let reference_altitude = if status.vertical_speed <= -1000 {
+                status.altitude + (status.vertical_speed as i32 / 2)
+            } else {
+                status.altitude
+            };
+
+            const HIGH_DENSITY_GREEN_OFFSET: i32 = 1000;
+            const HIGH_DENSITY_RED_OFFSET: i32 = 2000;
+
+            if is_normal_mode {
+                let high_density_green = reference_altitude - HIGH_DENSITY_GREEN_OFFSET;
+                let low_density_yellow = reference_altitude - gear_offset;
+                let high_density_red = reference_altitude + HIGH_DENSITY_RED_OFFSET;
+
+                let min_mode = if low_density_yellow <= high_density_green {
+                    TerrainLevelMode::Warning
+                } else {
+                    TerrainLevelMode::PeaksMode
+                };
+
+                let max_mode = if max_for_display >= high_density_red {
+                    TerrainLevelMode::Caution
+                } else {
+                    TerrainLevelMode::Warning
+                };
+
+                (min_mode, max_mode)
+            } else {
+                (TerrainLevelMode::PeaksMode, TerrainLevelMode::PeaksMode)
+            }
+        };
+
+        let nd_range = self.display_rendering.get(&side)
+            .map(|s| s.navigation_display.display_configuration().nd_range as f64)
+            .unwrap_or(10.0);
+
+        let first_frame = self.display_rendering.get(&side)
+            .map(|s| s.navigation_display.first_frame())
+            .unwrap_or(true);
+
+        let efis_mode = self.display_rendering.get(&side)
+            .map(|s| s.navigation_display.display_configuration().efis_mode)
+            .unwrap_or(0);
+
+        // Note: frame_byte_count is set to raw size here; caller updates after PNG encoding
+        let metadata = crate::types::NavigationDisplayData {
+            minimum_elevation: min_for_display as i16,
+            minimum_elevation_mode: min_mode,
+            maximum_elevation: max_for_display as i16,
+            maximum_elevation_mode: max_mode,
+            first_frame,
+            display_range: nd_range,
+            display_mode: efis_mode,
+            frame_byte_count: 0, // Will be set by caller after PNG encoding
+        };
+
+        // Mark first frame as false
+        if let Some(state) = self.display_rendering.get_mut(&side) {
+            state.navigation_display.set_first_frame(false);
+        }
+
+        Some((metadata, frame, width, height))
+    }
+
     /// Render a navigation display frame and return both metadata and frame data
     /// This is used by the SimConnect handler to send data back to the simulator
     pub fn render_frame_for_simconnect(&mut self, side: DisplaySide) -> Option<(crate::types::NavigationDisplayData, Vec<u8>)> {
@@ -1273,5 +1401,38 @@ impl TerrainProcessor {
         }
 
         Some((metadata, frame))
+    }
+
+    /// Get the current rendering mode
+    pub fn get_rendering_mode(&self) -> TerrainRenderingMode {
+        self.rendering_mode
+    }
+
+    /// Start a new transition cycle for a display side
+    /// Called when it's time to refresh the terrain display
+    pub fn start_transition_cycle(&mut self, side: DisplaySide, final_frame: Vec<u8>, width: usize, height: usize) {
+        if let Some(state) = self.display_rendering.get_mut(&side) {
+            let current_time = Instant::now();
+            state.navigation_display.start_new_map_cycle(current_time, width, height);
+            state.navigation_display.set_final_frame(final_frame);
+            debug!("Started transition cycle for {:?} with dimensions {}x{}", side, width, height);
+        }
+    }
+
+    /// Tick the transition animation for a display side
+    /// Returns true when transition is complete
+    pub fn tick_transition(&mut self, side: DisplaySide) -> bool {
+        if let Some(state) = self.display_rendering.get_mut(&side) {
+            state.navigation_display.render()
+        } else {
+            true // No state = consider complete
+        }
+    }
+
+    /// Get the current transition frame for a display side
+    pub fn get_current_transition_frame(&self, side: DisplaySide) -> Option<Vec<u8>> {
+        self.display_rendering.get(&side)
+            .and_then(|state| state.navigation_display.current_frame())
+            .cloned()
     }
 }

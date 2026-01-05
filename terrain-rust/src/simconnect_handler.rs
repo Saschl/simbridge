@@ -5,9 +5,10 @@
 //! Uses raw byte buffers with ClientDataDefinition since the aircraft sends
 //! packed binary data that won't match Rust's struct alignment.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::pin::Pin;
 use log::{info, warn, error, debug};
 
@@ -16,7 +17,8 @@ use msfs::sim_connect::{
 };
 
 use crate::types::{
-    AircraftStatus, EfisData, DisplaySide,
+    AircraftStatus, EfisData, DisplaySide, TerrainRenderingMode,
+    constants::*,
 };
 use crate::processing::TerrainProcessor;
 
@@ -92,13 +94,47 @@ enum SimConnectMessage {
 /// SimConnect handler for MSFS communication
 pub struct SimConnectHandler {
     terrain_processor: Arc<RwLock<TerrainProcessor>>,
+    /// Rendering state for each display side
+    rendering_state: HashMap<DisplaySide, DisplayRenderingState>,
+}
+
+/// State for display-side transition rendering
+struct DisplayRenderingState {
+    /// Whether a transition is currently in progress
+    transitioning: bool,
+    /// When the last transition cycle completed
+    last_cycle_complete: Instant,
+    /// Whether we've rendered the last frame of this cycle
+    rendered_last_frame: bool,
+    /// Frame dimensions for current cycle (width, height)
+    frame_dimensions: (usize, usize),
+    /// Base metadata for current cycle (frame_byte_count updated per frame after PNG encoding)
+    base_metadata: Option<crate::types::NavigationDisplayData>,
 }
 
 impl SimConnectHandler {
     /// Create a new SimConnect handler
     pub fn new(terrain_processor: Arc<RwLock<TerrainProcessor>>) -> Self {
+        let mut rendering_state = HashMap::new();
+        let now = Instant::now();
+        rendering_state.insert(DisplaySide::Left, DisplayRenderingState {
+            transitioning: false,
+            last_cycle_complete: now,
+            rendered_last_frame: false,
+            frame_dimensions: (0, 0),
+            base_metadata: None,
+        });
+        rendering_state.insert(DisplaySide::Right, DisplayRenderingState {
+            transitioning: false,
+            last_cycle_complete: now,
+            rendered_last_frame: false,
+            frame_dimensions: (0, 0),
+            base_metadata: None,
+        });
+
         SimConnectHandler {
             terrain_processor,
+            rendering_state,
         }
     }
 
@@ -208,6 +244,10 @@ impl SimConnectHandler {
         let frame_right: ClientDataArea<FrameDataChunk> =
             sim.get_client_area(CLIENT_DATA_NAME_FRAME_RIGHT)?;
 
+        // Timing for transition loop
+        let mut last_transition_tick = Instant::now();
+        let transition_interval = Duration::from_millis(RENDERING_MAP_TRANSITION_DELTA_TIME);
+
         // Main message loop
         loop {
             // Process SimConnect messages
@@ -219,25 +259,13 @@ impl SimConnectHandler {
                     SimConnectMessage::AircraftStatus(buffer) => {
                         let status = self.parse_aircraft_status(&buffer.data);
 
-                        info!("Aircraft status: lat={:.4}, lon={:.4}, alt={}, hdg={}, terr_capt={}, terr_fo={}, efis_mode_capt={}",
+                        debug!("Aircraft status: lat={:.4}, lon={:.4}, alt={}, hdg={}, terr_capt={}, terr_fo={}, efis_mode_capt={}",
                             status.latitude, status.longitude, status.altitude, status.heading,
                             status.efis_data_capt.terr_on_nd, status.efis_data_fo.terr_on_nd,
                             status.efis_data_capt.efis_mode);
 
                         if let Ok(mut processor) = self.terrain_processor.write() {
                             processor.aircraft_status_update(status.clone());
-                        }
-
-                        // Render and send frames if not paused
-                        if !*paused {
-                            debug!("Rendering frames (not paused)");
-                            self.render_and_send_frames(
-                                &mut sim,
-                                &metadata_left,
-                                &metadata_right,
-                                &frame_left,
-                                &frame_right,
-                            );
                         }
                     }
                     SimConnectMessage::SimulatorRunning(running) => {
@@ -264,8 +292,201 @@ impl SimConnectHandler {
                 }
             }
 
-            // Small sleep to prevent busy waiting
-            thread::sleep(Duration::from_millis(16));
+            // Run transition tick at 40ms intervals (like TypeScript's setInterval)
+            if !*paused && last_transition_tick.elapsed() >= transition_interval {
+                last_transition_tick = Instant::now();
+
+                self.tick_transitions(
+                    &mut sim,
+                    &metadata_left,
+                    &metadata_right,
+                    &frame_left,
+                    &frame_right,
+                );
+            }
+
+            // Small sleep to prevent busy waiting (target ~40ms tick rate)
+            let sleep_time = transition_interval.saturating_sub(last_transition_tick.elapsed());
+            if sleep_time > Duration::from_millis(1) {
+                thread::sleep(sleep_time.min(Duration::from_millis(10)));
+            }
+        }
+    }
+
+    /// Tick the transition system - called every RENDERING_MAP_TRANSITION_DELTA_TIME (40ms)
+    /// This matches TypeScript's setInterval-based transition loop
+    fn tick_transitions(
+        &mut self,
+        sim: &mut Pin<Box<SimConnect>>,
+        metadata_left: &ClientDataArea<MetadataBuffer>,
+        metadata_right: &ClientDataArea<MetadataBuffer>,
+        frame_left: &ClientDataArea<FrameDataChunk>,
+        frame_right: &ClientDataArea<FrameDataChunk>,
+    ) {
+        for side in [DisplaySide::Left, DisplaySide::Right] {
+            self.tick_transition_for_side(
+                sim,
+                side,
+                metadata_left,
+                metadata_right,
+                frame_left,
+                frame_right,
+            );
+        }
+    }
+
+    /// Tick the transition for a specific display side
+    fn tick_transition_for_side(
+        &mut self,
+        sim: &mut Pin<Box<SimConnect>>,
+        side: DisplaySide,
+        metadata_left: &ClientDataArea<MetadataBuffer>,
+        metadata_right: &ClientDataArea<MetadataBuffer>,
+        frame_left: &ClientDataArea<FrameDataChunk>,
+        frame_right: &ClientDataArea<FrameDataChunk>,
+    ) {
+        // Get current rendering state
+        let (is_transitioning, elapsed) = {
+            match self.rendering_state.get(&side) {
+                Some(s) => (s.transitioning, s.last_cycle_complete.elapsed()),
+                None => return,
+            }
+        };
+
+        // Get current rendering mode and timeout
+        let timeout = {
+            if let Ok(processor) = self.terrain_processor.read() {
+                let mode = processor.get_rendering_mode();
+                if mode == TerrainRenderingMode::ArcMode {
+                    Duration::from_millis(RENDERING_MAP_UPDATE_TIMEOUT_ARC_MODE)
+                } else {
+                    Duration::from_millis(RENDERING_MAP_UPDATE_TIMEOUT_SCANLINE_MODE)
+                }
+            } else {
+                return;
+            }
+        };
+
+        // Check if we need to start a new cycle
+        if !is_transitioning {
+            if elapsed >= timeout {
+                // Start a new rendering cycle
+                debug!("Starting new rendering cycle for {:?}", side);
+
+                // Render raw RGBA frame for transitions
+                let frame_result = {
+                    if let Ok(mut processor) = self.terrain_processor.write() {
+                        processor.render_raw_frame_for_transition(side)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((nav_data, raw_frame, width, height)) = frame_result {
+                    // Start the transition with raw RGBA frame and dimensions
+                    if let Ok(mut processor) = self.terrain_processor.write() {
+                        processor.start_transition_cycle(side, raw_frame, width, height);
+                    }
+
+                    // Store dimensions and base metadata for encoding during transition
+                    if let Some(state) = self.rendering_state.get_mut(&side) {
+                        state.transitioning = true;
+                        state.rendered_last_frame = false;
+                        state.frame_dimensions = (width, height);
+                        state.base_metadata = Some(nav_data);
+                    }
+                }
+            }
+            return;
+        }
+
+        // We're transitioning - tick the transition
+        let (transition_complete, current_frame) = {
+            if let Ok(mut processor) = self.terrain_processor.write() {
+                let complete = processor.tick_transition(side);
+                let frame = processor.get_current_transition_frame(side);
+                (complete, frame)
+            } else {
+                (false, None)
+            }
+        };
+
+        // Get stored dimensions and metadata for encoding
+        let (dimensions, base_metadata) = {
+            match self.rendering_state.get(&side) {
+                Some(s) => (s.frame_dimensions, s.base_metadata.clone()),
+                None => return,
+            }
+        };
+
+        // Encode and send the current transition frame if available
+        if let Some(raw_frame) = current_frame {
+            // Encode raw RGBA to PNG
+            let png_frame = {
+                if let Ok(processor) = self.terrain_processor.read() {
+                    processor.encode_to_png(&raw_frame, dimensions.0, dimensions.1)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(png_data) = png_frame {
+                // Update metadata with actual PNG size and send
+                if let Some(mut nav_data) = base_metadata {
+                    nav_data.frame_byte_count = png_data.len() as u32;
+
+                    let metadata = self.pack_metadata(&nav_data);
+                    let meta_area = match side {
+                        DisplaySide::Left => metadata_left,
+                        DisplaySide::Right => metadata_right,
+                    };
+                    if let Err(e) = sim.set_client_data(meta_area, &metadata) {
+                        error!("Failed to send metadata for {:?}: {:?}", side, e);
+                    }
+                }
+
+                // Send the PNG frame
+                let frame_area = match side {
+                    DisplaySide::Left => frame_left,
+                    DisplaySide::Right => frame_right,
+                };
+                Self::send_frame_data_static(sim, frame_area, &png_data);
+            }
+        }
+
+        // Check if transition is complete
+        if transition_complete {
+            debug!("Transition complete for {:?}", side);
+            if let Some(state) = self.rendering_state.get_mut(&side) {
+                state.transitioning = false;
+                state.last_cycle_complete = Instant::now();
+                state.rendered_last_frame = true;
+                state.base_metadata = None;
+            }
+        }
+    }
+
+    /// Send frame data in chunks (static version to avoid borrow issues)
+    fn send_frame_data_static(
+        sim: &mut Pin<Box<SimConnect>>,
+        area: &ClientDataArea<FrameDataChunk>,
+        frame: &[u8],
+    ) {
+        let chunks = (frame.len() + FRAME_CHUNK_SIZE - 1) / FRAME_CHUNK_SIZE;
+        debug!("Sending {} bytes in {} chunks (frame size: {})", frame.len(), chunks, FRAME_CHUNK_SIZE);
+
+        for i in 0..chunks {
+            let start = i * FRAME_CHUNK_SIZE;
+            let remaining = frame.len() - start;
+            let byte_count = remaining.min(FRAME_CHUNK_SIZE);
+
+            let mut chunk = FrameDataChunk::default();
+            chunk.data[..byte_count].copy_from_slice(&frame[start..start + byte_count]);
+
+            if let Err(e) = sim.set_client_data(area, &chunk) {
+                error!("Failed to send frame chunk {}: {:?}", i, e);
+                break;
+            }
         }
     }
 
@@ -397,98 +618,26 @@ impl SimConnectHandler {
         buffer.data[12] = byte_count_bytes[2];
         buffer.data[13] = byte_count_bytes[3];
 
-        info!("Packed metadata: min_elev={}, min_mode={:?}, max_elev={}, max_mode={:?}, first={}, range={}, mode={}, byte_count={}",
+        debug!("Packed metadata: min_elev={}, min_mode={:?}, max_elev={}, max_mode={:?}, first={}, range={}, mode={}, byte_count={}",
             nav_data.minimum_elevation, nav_data.minimum_elevation_mode,
             nav_data.maximum_elevation, nav_data.maximum_elevation_mode,
             nav_data.first_frame, display_range, nav_data.display_mode, nav_data.frame_byte_count);
-        info!("Metadata bytes: {:02x?}", &buffer.data);
+        debug!("Metadata bytes: {:02x?}", &buffer.data);
 
         buffer
-    }
-
-    /// Render frames and send to simulator
-    fn render_and_send_frames(
-        &self,
-        sim: &mut Pin<Box<SimConnect>>,
-        metadata_left: &ClientDataArea<MetadataBuffer>,
-        metadata_right: &ClientDataArea<MetadataBuffer>,
-        frame_left: &ClientDataArea<FrameDataChunk>,
-        frame_right: &ClientDataArea<FrameDataChunk>,
-    ) {
-        for side in [DisplaySide::Left, DisplaySide::Right] {
-            let frame_data = {
-                if let Ok(mut processor) = self.terrain_processor.write() {
-                    let result = processor.render_frame_for_simconnect(side);
-                    if result.is_none() {
-                        debug!("render_frame_for_simconnect({:?}) returned None", side);
-                    }
-                    result
-                } else {
-                    warn!("Failed to acquire terrain_processor write lock");
-                    None
-                }
-            };
-
-            if let Some((nav_data, frame)) = frame_data {
-                info!("Sending frame for {:?}: {} bytes, min_elev={}, max_elev={}, range={}, first={}",
-                    side, frame.len(), nav_data.minimum_elevation, nav_data.maximum_elevation,
-                    nav_data.display_range, nav_data.first_frame);
-                // Pack metadata to wire format
-                let metadata = self.pack_metadata(&nav_data);
-
-                // Send metadata and frame
-                let (meta_area, frame_area) = match side {
-                    DisplaySide::Left => (metadata_left, frame_left),
-                    DisplaySide::Right => (metadata_right, frame_right),
-                };
-
-                if let Err(e) = sim.set_client_data(meta_area, &metadata) {
-                    error!("Failed to send metadata for {:?}: {:?}", side, e);
-                    continue;
-                }
-                debug!("Sent metadata for {:?}", side);
-
-                // Send frame data in chunks
-                self.send_frame_data(sim, frame_area, &frame);
-                debug!("Sent frame data for {:?}", side);
-            }
-        }
-    }
-
-    /// Send frame data in chunks
-    fn send_frame_data(
-        &self,
-        sim: &mut Pin<Box<SimConnect>>,
-        area: &ClientDataArea<FrameDataChunk>,
-        frame: &[u8],
-    ) {
-        let chunks = (frame.len() + FRAME_CHUNK_SIZE - 1) / FRAME_CHUNK_SIZE;
-        info!("Sending {} bytes in {} chunks (frame size: {})", frame.len(), chunks, FRAME_CHUNK_SIZE);
-
-        for i in 0..chunks {
-            let start = i * FRAME_CHUNK_SIZE;
-            let remaining = frame.len() - start;
-            let byte_count = remaining.min(FRAME_CHUNK_SIZE);
-
-            let mut chunk = FrameDataChunk::default();
-            chunk.data[..byte_count].copy_from_slice(&frame[start..start + byte_count]);
-
-            debug!("Sending chunk {}/{}: {} bytes (first 4 bytes: {:02x} {:02x} {:02x} {:02x})",
-                i + 1, chunks, byte_count,
-                chunk.data[0], chunk.data[1], chunk.data[2], chunk.data[3]);
-
-            if let Err(e) = sim.set_client_data(area, &chunk) {
-                error!("Failed to send frame chunk {}: {:?}", i, e);
-                break;
-            }
-        }
-        info!("Frame data transmission complete");
     }
 
     /// Handle reset (disconnect or sim state change)
     fn on_reset(&mut self) {
         if let Ok(mut processor) = self.terrain_processor.write() {
             processor.reset();
+        }
+        // Reset rendering state
+        let now = Instant::now();
+        for state in self.rendering_state.values_mut() {
+            state.transitioning = false;
+            state.last_cycle_complete = now;
+            state.rendered_last_frame = false;
         }
     }
 }

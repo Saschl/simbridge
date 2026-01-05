@@ -392,12 +392,23 @@ pub mod constants {
     pub const VERTICAL_DISPLAY_MAP_START_OFFSET_Y: usize = 800;
     pub const VERTICAL_DISPLAY_MAP_START_OFFSET_X: usize = 150;
 
-    // Rendering parameters
-    pub const RENDERING_MAP_TRANSITION_DELTA_TIME: u64 = 40;
-    pub const RENDERING_MAP_TRANSITION_DURATION_ARC_MODE: u64 = 1500;
-    pub const RENDERING_MAP_UPDATE_TIMEOUT_ARC_MODE: u64 = 1000;
-    pub const RENDERING_MAP_TRANSITION_DURATION_SCANLINE_MODE: u64 = 600;
-    pub const RENDERING_MAP_UPDATE_TIMEOUT_SCANLINE_MODE: u64 = 500;
+    // Rendering parameters - transition timing
+    pub const RENDERING_MAP_TRANSITION_DELTA_TIME: u64 = 40; // ms between transition steps
+    pub const RENDERING_MAP_TRANSITION_DURATION_ARC_MODE: u64 = 1500; // ms for full arc transition
+    pub const RENDERING_MAP_UPDATE_TIMEOUT_ARC_MODE: u64 = 1000; // ms between map updates in arc mode
+    pub const RENDERING_MAP_TRANSITION_DURATION_SCANLINE_MODE: u64 = 600; // ms for full scanline transition
+    pub const RENDERING_MAP_UPDATE_TIMEOUT_SCANLINE_MODE: u64 = 500; // ms between map updates in scanline mode
+
+    // Frame validity duration (transition + update timeout)
+    pub const RENDERING_MAP_FRAME_VALIDITY_TIME_ARC_MODE: u64 =
+        RENDERING_MAP_TRANSITION_DURATION_ARC_MODE + RENDERING_MAP_UPDATE_TIMEOUT_ARC_MODE; // 2500ms
+    pub const RENDERING_MAP_FRAME_VALIDITY_TIME_SCANLINE_MODE: u64 =
+        RENDERING_MAP_TRANSITION_DURATION_SCANLINE_MODE + RENDERING_MAP_UPDATE_TIMEOUT_SCANLINE_MODE; // 1100ms
+
+    // Angular step per transition tick for arc mode: round((90 / duration) * delta_time)
+    // (90 / 1500) * 40 = 2.4 -> rounds to 2
+    pub const RENDERING_MAP_TRANSITION_ANGULAR_STEP: i32 =
+        ((90.0 / RENDERING_MAP_TRANSITION_DURATION_ARC_MODE as f64) * RENDERING_MAP_TRANSITION_DELTA_TIME as f64) as i32;
 
     // Display dimensions
     pub const DISPLAY_SCREEN_PIXEL_HEIGHT_WITHOUT_VERTICAL_DISPLAY: usize = 768;
