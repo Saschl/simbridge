@@ -219,6 +219,14 @@ impl NavigationDisplayRenderer {
                 display_mode: 0,
                 frame_byte_count: 0,
             };
+            
+            // Clear last_frame so the transition shows only the new rendered area
+            // (no old data to blend with - like TypeScript behavior on range change)
+            self.rendering_data.last_frame = None;
+            self.rendering_data.final_frame = None;
+            self.rendering_data.current_frame = None;
+            
+            log::debug!("Config changed - cleared frames for fresh transition");
         }
 
         self.configuration = config;
@@ -249,6 +257,12 @@ impl NavigationDisplayRenderer {
         self.rendering_data.threshold_data.first_frame = first_frame;
     }
 
+    /// Check if a new render cycle is needed (config changed, frames invalidated)
+    pub fn needs_new_cycle(&self) -> bool {
+        // If we have no final_frame (cleared after config change), we need a new cycle
+        self.rendering_data.final_frame.is_none()
+    }
+
     /// Set the final (fully rendered) frame for transition
     /// Note: frame dimensions should be set via start_new_map_cycle before this
     pub fn set_final_frame(&mut self, frame: Vec<u8>) {
@@ -276,6 +290,13 @@ impl NavigationDisplayRenderer {
         self.rendering_data.frame_height = frame_height;
 
         let map_height = frame_height as u32;
+
+        log::debug!(
+            "start_new_map_cycle: dims={}x{}, last_frame={}, nd_range={}",
+            frame_width, frame_height,
+            self.rendering_data.last_frame.as_ref().map(|f| f.len()).unwrap_or(0),
+            self.configuration.nd_range
+        );
 
         if self.configuration.nd_range == 0 {
             self.reset();
@@ -336,6 +357,16 @@ impl NavigationDisplayRenderer {
         // Use dimensions stored when frame was set (from actual rendered frame)
         let map_width = self.rendering_data.frame_width;
         let map_height = self.rendering_data.frame_height;
+
+        // Debug log last_frame state
+        log::debug!(
+            "arc_mode_transition: last_frame={}, final_frame={}, dims={}x{}, border={}/{}",
+            self.rendering_data.last_frame.as_ref().map(|f| f.len()).unwrap_or(0),
+            final_frame.len(),
+            map_width, map_height,
+            self.rendering_data.start_transition_border,
+            self.rendering_data.current_transition_border
+        );
 
         // Verify dimensions are valid
         if map_width == 0 || map_height == 0 {

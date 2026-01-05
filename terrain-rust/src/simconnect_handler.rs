@@ -367,11 +367,24 @@ impl SimConnectHandler {
             }
         };
 
-        // Check if we need to start a new cycle
+        // Check if config changed and we need an immediate new cycle
+        let needs_immediate_cycle = {
+            if let Ok(processor) = self.terrain_processor.read() {
+                processor.needs_new_cycle(side)
+            } else {
+                false
+            }
+        };
+
+        // Check if we need to start a new cycle (either timeout or config change)
         if !is_transitioning {
-            if elapsed >= timeout {
+            if elapsed >= timeout || needs_immediate_cycle {
                 // Start a new rendering cycle
-                debug!("Starting new rendering cycle for {:?}", side);
+                if needs_immediate_cycle {
+                    debug!("Starting immediate rendering cycle for {:?} (config changed)", side);
+                } else {
+                    debug!("Starting new rendering cycle for {:?} (timeout)", side);
+                }
 
                 // Render raw RGBA frame for transitions
                 let frame_result = {

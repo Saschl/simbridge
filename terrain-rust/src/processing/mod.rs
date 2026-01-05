@@ -1435,4 +1435,12 @@ impl TerrainProcessor {
             .and_then(|state| state.navigation_display.current_frame())
             .cloned()
     }
+
+    /// Check if a display side needs a new render cycle immediately
+    /// (e.g., after config change when frames were invalidated)
+    pub fn needs_new_cycle(&self, side: DisplaySide) -> bool {
+        self.display_rendering.get(&side)
+            .map(|state| state.navigation_display.needs_new_cycle())
+            .unwrap_or(false)
+    }
 }
