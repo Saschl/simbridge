@@ -776,6 +776,20 @@ impl VerticalDisplayRenderer {
             (efis.nd_range / 2).max(5).min(160) as f64
         };
 
+        // Detect configuration changes that require a fresh transition
+        let config_changed =
+            self.display_config.minimum_altitude != efis.vd_range_lower ||
+            self.display_config.maximum_altitude != efis.vd_range_upper ||
+            (self.display_config.range - efis.nd_range as f64).abs() > 0.1;
+
+        if config_changed {
+            // Clear frames so the transition starts fresh (no old data to blend with)
+            self.rendering_data.last_frame = None;
+            self.rendering_data.final_frame = None;
+            self.rendering_data.current_frame = None;
+            log::debug!("VD config changed - cleared frames for fresh transition");
+        }
+
         self.elevation_config.range = vd_range;
         self.display_config.range = efis.nd_range as f64;
         self.display_config.minimum_altitude = efis.vd_range_lower;

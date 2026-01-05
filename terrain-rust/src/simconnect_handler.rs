@@ -619,6 +619,7 @@ impl SimConnectHandler {
         let arc_mode_fo = buffer[34] != 0;
         let terr_enabled_fo = buffer[35] != 0;
         let efis_mode_fo = buffer[36];
+        info!("terr_enabled_fo: {}", terr_enabled_fo);
 
         let rendering_mode = buffer[37];
         let ground_truth_lat = f32::from_le_bytes([buffer[38], buffer[39], buffer[40], buffer[41]]) as f64;
