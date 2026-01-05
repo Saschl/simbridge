@@ -374,14 +374,14 @@ impl NavigationDisplayRenderer {
         let map_height = self.rendering_data.frame_height;
 
         // Debug log last_frame state
-        log::debug!(
+       /*  log::debug!(
             "arc_mode_transition: last_frame={}, final_frame={}, dims={}x{}, border={}/{}",
             self.rendering_data.last_frame.as_ref().map(|f| f.len()).unwrap_or(0),
             final_frame.len(),
             map_width, map_height,
             self.rendering_data.start_transition_border,
             self.rendering_data.current_transition_border
-        );
+        ); */
 
         // Verify dimensions are valid
         if map_width == 0 || map_height == 0 {
@@ -675,6 +675,7 @@ struct ElevationProfileConfig {
     fms_path_used: bool,
 }
 
+#[derive(Clone)]
 pub struct VerticalDisplayConfig {
     pub range: f64,
     pub minimum_altitude: i32,

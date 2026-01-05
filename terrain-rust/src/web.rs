@@ -27,7 +27,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         web::scope("/api/v1/terrain")
             .route("/renderingTimestamp", web::get().to(rendering_timestamp))
             .route("/renderingThresholds", web::get().to(rendering_thresholds))
-            .route("/renderingFrames", web::get().to(rendering_frames))
+           // .route("/renderingFrames", web::get().to(rendering_frames))
             .route("/aircraftStatusData", web::post().to(aircraft_status_data))
             .route("/verticalDisplayPath", web::post().to(vertical_display_path))
     )
@@ -86,37 +86,6 @@ async fn rendering_thresholds(
     }
 }
 
-/// GET /api/v1/terrain/renderingFrames
-/// Returns the base64 strings for the current frames
-async fn rendering_frames(
-    data: web::Data<AppState>,
-    query: web::Query<DisplayQuery>,
-) -> impl Responder {
-    let side = match parse_display_side(&query.display) {
-        Ok(s) => s,
-        Err(_) => return HttpResponse::BadRequest().json(Vec::<String>::new()),
-    };
-
-    // Need write lock for rendering
-    let mut processor = match data.terrain_processor.write() {
-        Ok(p) => p,
-        Err(_) => return HttpResponse::InternalServerError().json(Vec::<String>::new()),
-    };
-
-    // Render frames if needed and get current data
-    let frame_data = match processor.render_frames(side) {
-        Some(fd) => fd,
-        None => return HttpResponse::Ok().json(Vec::<String>::new()),
-    };
-
-    // Convert frames to base64
-    let base64_frames: Vec<String> = frame_data.frames
-        .iter()
-        .map(|frame| BASE64.encode(frame))
-        .collect();
-
-    HttpResponse::Ok().json(base64_frames)
-}
 
 /// POST /api/v1/terrain/aircraftStatusData
 /// Update aircraft status data

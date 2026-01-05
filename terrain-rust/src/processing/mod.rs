@@ -387,7 +387,7 @@ impl TerrainProcessor {
             }
         };
 
-        debug!("update_cached_tiles: pos=({:.4}, {:.4})", position.latitude, position.longitude);
+     //   debug!("update_cached_tiles: pos=({:.4}, {:.4})", position.latitude, position.longitude);
 
         let lookup = worldmap.create_grid_lookup_table(
             position,
@@ -523,6 +523,9 @@ impl TerrainProcessor {
             (0, 0, false)
         };
 
+        // NOTE: Vertical display is rendered separately with its own transition
+        // It will be composited onto the frame after both transitions are applied
+
         Some((frame, min_elev, max_elev, is_normal_mode, display_width, display_height))
     }
 
@@ -540,7 +543,7 @@ impl TerrainProcessor {
                     DisplaySide::Left => "left",
                     DisplaySide::Right => "right",
                 };
-                let debug_path = std::path::PathBuf::from(r"C:\temp\terrain_debug");
+            /*     let debug_path = std::path::PathBuf::from(r"C:\temp\terrain_debug");
                 if let Err(e) = std::fs::create_dir_all(&debug_path) {
                     warn!("Failed to create debug directory {:?}: {}", debug_path, e);
                 }
@@ -550,7 +553,7 @@ impl TerrainProcessor {
                 } else {
                     info!("Saved debug PNG to {:?}", filename);
                 }
-
+ */
                 Some((png_data, min_elev, max_elev, is_normal_mode))
             }
             Err(e) => {
@@ -656,7 +659,7 @@ impl TerrainProcessor {
             metadata.width, metadata.height);
 
         // Debug: sample elevation at aircraft position
-        let aircraft_sample_x = ((aircraft_lon - metadata.southwest.longitude) / lon_step) as usize;
+      /*   let aircraft_sample_x = ((aircraft_lon - metadata.southwest.longitude) / lon_step) as usize;
         let aircraft_sample_y = ((metadata.northeast.latitude - aircraft_lat) / lat_step) as usize;
         if aircraft_sample_x < metadata.width && aircraft_sample_y < metadata.height {
             let idx = aircraft_sample_y * metadata.width + aircraft_sample_x;
@@ -664,7 +667,7 @@ impl TerrainProcessor {
                 debug!("Elevation at aircraft position: {} ft (grid pos: {}, {})",
                     cached_data.data[idx] as i16, aircraft_sample_x, aircraft_sample_y);
             }
-        }
+        } */
 
         let center_x = map_width as f64 / 2.0;
 
@@ -871,14 +874,14 @@ impl TerrainProcessor {
             min_elevation,
             max_elevation,
         };
-
+/*
         debug!("Thresholds: low_green={}, high_green={}, low_yellow={}, high_yellow={}, high_red={}",
             thresholds.low_density_green, thresholds.high_density_green, thresholds.low_density_yellow,
             thresholds.high_density_yellow, thresholds.high_density_red);
         debug!("Elevation range: {} to {} ft, aircraft: {} ft (ref: {}), cutoff: {} ft, using {} mode",
             thresholds.min_elevation, thresholds.max_elevation, status.altitude, thresholds.reference_altitude,
             thresholds.cutoff_altitude, if thresholds.use_normal_mode { "NORMAL" } else { "PEAKS" });
-
+ */
         // Second pass: Render each pixel
         for y in 0..map_height {
             for x in 0..map_width {
@@ -995,9 +998,9 @@ impl TerrainProcessor {
         }
 
         // Log color distribution
-        debug!("Color distribution: {:?}", color_stats);
+      /*   debug!("Color distribution: {:?}", color_stats);
         debug!("Sample elevations (first 100): {:?}", elevation_samples);
-        debug!("Aircraft altitude: {} ft, gear down: {}", status.altitude, status.gear_is_down);
+        debug!("Aircraft altitude: {} ft, gear down: {}", status.altitude, status.gear_is_down); */
 
         // Draw aircraft position marker (white cross) at center-bottom
         let aircraft_pixel_x = offset_x + (map_width / 2);
@@ -1053,6 +1056,281 @@ impl TerrainProcessor {
         let max_for_display = (max_bin + 1) * HISTOGRAM_BIN_RANGE + HISTOGRAM_MINIMUM_ELEVATION;
 
         (min_for_display, max_for_display, thresholds.use_normal_mode)
+    }
+
+    /// Render vertical display terrain to a separate buffer for transition processing
+    /// Returns a buffer sized for the vertical display (RENDERING_ELEVATION_PROFILE_WIDTH x RENDERING_ELEVATION_PROFILE_HEIGHT)
+    fn render_vertical_display_raw(
+        &self,
+        side: DisplaySide,
+        status: &AircraftStatus,
+    ) -> Option<Vec<u8>> {
+        let cached_data = match &self.cached_elevation_data {
+            Some(data) => data,
+            None => {
+                debug!("render_vertical_display_raw: no cached elevation data");
+                return None;
+            }
+        };
+
+        let metadata = &self.world_map_metadata;
+        if metadata.width == 0 || metadata.height == 0 {
+            debug!("render_vertical_display_raw: invalid world map metadata");
+            return None;
+        }
+
+        // Get vertical display configuration
+        let vd_config = match self.display_rendering.get(&side) {
+            Some(state) => state.vertical_display.display_configuration().clone(),
+            None => {
+                debug!("render_vertical_display_raw: no display state for {:?}", side);
+                return None;
+            }
+        };
+
+        // Get navigation display config for heading
+        let nd_config = match self.display_rendering.get(&side) {
+            Some(state) => state.navigation_display.display_configuration().clone(),
+            None => return None,
+        };
+
+        let vd_width = RENDERING_ELEVATION_PROFILE_WIDTH;
+        let vd_height = RENDERING_ELEVATION_PROFILE_HEIGHT;
+        let min_altitude = vd_config.minimum_altitude;
+        let max_altitude = vd_config.maximum_altitude;
+
+        // Get elevation profile range (how far ahead to sample, in nm)
+        // For arc mode, use nd_range; for rose mode, use nd_range / 2
+        let profile_range_nm = if nd_config.arc_mode {
+            nd_config.nd_range.max(10).min(160) as f64
+        } else {
+            (nd_config.nd_range / 2).max(5).min(160) as f64
+        };
+
+        // Create elevation profile along heading
+        let elevation_profile = self.create_elevation_profile(
+            status.latitude,
+            status.longitude,
+            status.heading as f64,
+            profile_range_nm,
+            vd_width,
+        );
+
+        // Create buffer for VD
+        let mut buffer = vec![0u8; vd_width * vd_height * RENDERING_COLOR_CHANNEL_COUNT];
+
+        // Render the vertical display
+        let altitude_range = (max_altitude - min_altitude) as f64;
+        let altitude_step = altitude_range / vd_height as f64;
+
+        for y in 0..vd_height {
+            // Altitude at this row (top = max, bottom = min)
+            let altitude = (vd_height - y) as f64 * altitude_step + min_altitude as f64;
+
+            for x in 0..vd_width {
+                let elevation = elevation_profile[x];
+
+                // Calculate pixel position in the buffer
+                let buf_idx = (y * vd_width + x) * RENDERING_COLOR_CHANNEL_COUNT;
+
+                // Determine color based on elevation vs altitude
+                let (r, g, b, a) = if elevation == INVALID_ELEVATION as f32 || elevation == UNKNOWN_ELEVATION as f32 {
+                    // Unknown/invalid - magenta
+                    (255u8, 148u8, 255u8, 255u8)
+                } else if altitude > elevation as f64 {
+                    // Above terrain - transparent background
+                    (0u8, 0u8, 0u8, 0u8)
+                } else if elevation == WATER_ELEVATION as f32 {
+                    // Water - cyan if at/below sea level
+                    if altitude <= 0.0 {
+                        (0u8, 255u8, 255u8, 255u8)
+                    } else {
+                        (0u8, 0u8, 0u8, 0u8)
+                    }
+                } else {
+                    // Terrain/obstacle - brown color (like TypeScript: 110, 51, 14)
+                    (110u8, 51u8, 14u8, 255u8)
+                };
+
+                buffer[buf_idx] = r;
+                buffer[buf_idx + 1] = g;
+                buffer[buf_idx + 2] = b;
+                buffer[buf_idx + 3] = a;
+            }
+        }
+
+        debug!("Vertical display raw rendering complete for {:?}", side);
+        Some(buffer)
+    }
+
+    /// Render vertical display terrain profile to the frame buffer
+    /// The VD shows terrain elevation along the flight path as a cross-section view
+    fn render_vertical_display_to_frame(
+        &self,
+        frame: &mut [u8],
+        frame_width: usize,
+        side: DisplaySide,
+        status: &AircraftStatus,
+    ) {
+        let cached_data = match &self.cached_elevation_data {
+            Some(data) => data,
+            None => {
+                debug!("render_vertical_display_to_frame: no cached elevation data");
+                return;
+            }
+        };
+
+        let metadata = &self.world_map_metadata;
+        if metadata.width == 0 || metadata.height == 0 {
+            debug!("render_vertical_display_to_frame: invalid world map metadata");
+            return;
+        }
+
+        // Get vertical display configuration
+        let vd_config = match self.display_rendering.get(&side) {
+            Some(state) => state.vertical_display.display_configuration().clone(),
+            None => {
+                debug!("render_vertical_display_to_frame: no display state for {:?}", side);
+                return;
+            }
+        };
+
+        // Get navigation display config for heading
+        let nd_config = match self.display_rendering.get(&side) {
+            Some(state) => state.navigation_display.display_configuration().clone(),
+            None => return,
+        };
+
+        let vd_width = RENDERING_ELEVATION_PROFILE_WIDTH;
+        let vd_height = RENDERING_ELEVATION_PROFILE_HEIGHT;
+        let min_altitude = vd_config.minimum_altitude;
+        let max_altitude = vd_config.maximum_altitude;
+
+        // Get elevation profile range (how far ahead to sample, in nm)
+        // For arc mode, use nd_range; for rose mode, use nd_range / 2
+        let profile_range_nm = if nd_config.arc_mode {
+            nd_config.nd_range.max(10).min(160) as f64
+        } else {
+            (nd_config.nd_range / 2).max(5).min(160) as f64
+        };
+
+        // Create elevation profile along heading
+        let elevation_profile = self.create_elevation_profile(
+            status.latitude,
+            status.longitude,
+            status.heading as f64,
+            profile_range_nm,
+            vd_width,
+        );
+
+        // Render the vertical display
+        let altitude_range = (max_altitude - min_altitude) as f64;
+        let altitude_step = altitude_range / vd_height as f64;
+
+        // Calculate lat/lon steps for the world map
+        let lat_step = (metadata.northeast.latitude - metadata.southwest.latitude) / metadata.height as f64;
+        let lon_step = (metadata.northeast.longitude - metadata.southwest.longitude) / metadata.width as f64;
+
+        for y in 0..vd_height {
+            // Altitude at this row (top = max, bottom = min)
+            let altitude = (vd_height - y) as f64 * altitude_step + min_altitude as f64;
+
+            for x in 0..vd_width {
+                let elevation = elevation_profile[x];
+
+                // Calculate pixel position in the output frame
+                let frame_x = VERTICAL_DISPLAY_MAP_START_OFFSET_X + x;
+                let frame_y = VERTICAL_DISPLAY_MAP_START_OFFSET_Y + y;
+                let frame_idx = (frame_y * frame_width + frame_x) * RENDERING_COLOR_CHANNEL_COUNT;
+
+                if frame_idx + 3 >= frame.len() {
+                    continue;
+                }
+
+                // Determine color based on elevation vs altitude
+                let (r, g, b, a) = if elevation == INVALID_ELEVATION as f32 || elevation == UNKNOWN_ELEVATION as f32 {
+                    // Unknown/invalid - magenta
+                    (255u8, 148u8, 255u8, 255u8)
+                } else if altitude > elevation as f64 {
+                    // Above terrain - transparent background
+                    (0u8, 0u8, 0u8, 0u8)
+                } else if elevation == WATER_ELEVATION as f32 {
+                    // Water - cyan if at/below sea level
+                    if altitude <= 0.0 {
+                        (0u8, 255u8, 255u8, 255u8)
+                    } else {
+                        (0u8, 0u8, 0u8, 0u8)
+                    }
+                } else {
+                    // Terrain/obstacle - brown color (like TypeScript: 110, 51, 14)
+                    (110u8, 51u8, 14u8, 255u8)
+                };
+
+                frame[frame_idx] = r;
+                frame[frame_idx + 1] = g;
+                frame[frame_idx + 2] = b;
+                frame[frame_idx + 3] = a;
+            }
+        }
+
+        debug!("Vertical display rendering complete for {:?}", side);
+    }
+
+    /// Create an elevation profile along the aircraft heading
+    /// Returns a vector of elevations (one per pixel width)
+    fn create_elevation_profile(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        heading: f64,
+        range_nm: f64,
+        profile_width: usize,
+    ) -> Vec<f32> {
+        let mut profile = vec![INVALID_ELEVATION as f32; profile_width];
+
+        let cached_data = match &self.cached_elevation_data {
+            Some(data) => data,
+            None => return profile,
+        };
+
+        let metadata = &self.world_map_metadata;
+        if metadata.width == 0 || metadata.height == 0 {
+            return profile;
+        }
+
+        // Calculate distance per pixel
+        let total_distance_m = range_nm * NAUTICAL_MILES_TO_METRES;
+        let distance_per_pixel = total_distance_m / profile_width as f64;
+
+        // Calculate lat/lon steps for the world map
+        let lat_step = (metadata.northeast.latitude - metadata.southwest.latitude) / metadata.height as f64;
+        let lon_step = (metadata.northeast.longitude - metadata.southwest.longitude) / metadata.width as f64;
+
+        for x in 0..profile_width {
+            let distance_m = x as f64 * distance_per_pixel;
+
+            // Project position at this distance along heading
+            let (proj_lat, proj_lon) = Self::project_wgs84(latitude, longitude, heading, distance_m);
+
+            // Check if within cached map bounds
+            if proj_lat < metadata.southwest.latitude || proj_lat > metadata.northeast.latitude ||
+               proj_lon < metadata.southwest.longitude || proj_lon > metadata.northeast.longitude {
+                continue; // Leave as invalid
+            }
+
+            // Convert to pixel coordinates in cached data
+            let sample_x = ((proj_lon - metadata.southwest.longitude) / lon_step) as usize;
+            let sample_y = ((metadata.northeast.latitude - proj_lat) / lat_step) as usize;
+
+            if sample_x < metadata.width && sample_y < metadata.height {
+                let elevation_idx = sample_y * metadata.width + sample_x;
+                if elevation_idx < cached_data.data.len() {
+                    profile[x] = cached_data.data[elevation_idx];
+                }
+            }
+        }
+
+        profile
     }
 
     /// Determine terrain color based on pre-calculated thresholds
@@ -1164,9 +1442,9 @@ impl TerrainProcessor {
     }
 
     fn encode_frame_to_png(&self, frame: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
-        use png::{BitDepth, ColorType, Encoder};
+        use png::{BitDepth, ColorType, Encoder, FilterType};
 
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(frame.len() + 1024); // Pre-allocate
         {
             let mut encoder = Encoder::new(&mut output, width as u32, height as u32);
             encoder.set_color(ColorType::Rgba);
@@ -1217,7 +1495,7 @@ impl TerrainProcessor {
             let nd_config = state.navigation_display.display_configuration();
 
             if !nd_config.terr_on_nd && !nd_config.terr_on_vd {
-                debug!("Terrain display not enabled for {:?}", side);
+                //debug!("Terrain display not enabled for {:?}", side);
                 return None;
             }
         }
@@ -1416,15 +1694,36 @@ impl TerrainProcessor {
             let current_time = Instant::now();
             state.navigation_display.start_new_map_cycle(current_time, width, height);
             state.navigation_display.set_final_frame(final_frame);
-            debug!("Started transition cycle for {:?} with dimensions {}x{}", side, width, height);
+            debug!("Started ND transition cycle for {:?} with dimensions {}x{}", side, width, height);
         }
     }
 
-    /// Tick the transition animation for a display side
+    /// Start a new transition cycle for the vertical display
+    pub fn start_vd_transition_cycle(&mut self, side: DisplaySide, final_frame: Vec<u8>) {
+        if let Some(state) = self.display_rendering.get_mut(&side) {
+            let current_time = Instant::now();
+            state.vertical_display.start_new_map_cycle(current_time);
+            state.vertical_display.set_final_frame(final_frame);
+            debug!("Started VD transition cycle for {:?} with dimensions {}x{}", 
+                side, RENDERING_ELEVATION_PROFILE_WIDTH, RENDERING_ELEVATION_PROFILE_HEIGHT);
+        }
+    }
+
+    /// Tick the transition animation for a display side (ND only)
     /// Returns true when transition is complete
     pub fn tick_transition(&mut self, side: DisplaySide) -> bool {
         if let Some(state) = self.display_rendering.get_mut(&side) {
             state.navigation_display.render()
+        } else {
+            true // No state = consider complete
+        }
+    }
+
+    /// Tick the VD transition animation for a display side
+    /// Returns true when transition is complete
+    pub fn tick_vd_transition(&mut self, side: DisplaySide) -> bool {
+        if let Some(state) = self.display_rendering.get_mut(&side) {
+            state.vertical_display.render()
         } else {
             true // No state = consider complete
         }
@@ -1435,6 +1734,76 @@ impl TerrainProcessor {
         self.display_rendering.get(&side)
             .and_then(|state| state.navigation_display.current_frame())
             .cloned()
+    }
+
+    /// Get the current VD transition frame for a display side
+    pub fn get_current_vd_transition_frame(&self, side: DisplaySide) -> Option<Vec<u8>> {
+        self.display_rendering.get(&side)
+            .and_then(|state| state.vertical_display.current_frame())
+            .cloned()
+    }
+
+    /// Composite the VD transition frame onto the ND transition frame
+    /// The VD is overlaid at (VERTICAL_DISPLAY_MAP_START_OFFSET_X, VERTICAL_DISPLAY_MAP_START_OFFSET_Y)
+    pub fn composite_vd_onto_nd(&self, nd_frame: &mut [u8], nd_width: usize, vd_frame: &[u8]) {
+        let vd_width = RENDERING_ELEVATION_PROFILE_WIDTH;
+        let vd_height = RENDERING_ELEVATION_PROFILE_HEIGHT;
+
+        for y in 0..vd_height {
+            for x in 0..vd_width {
+                let nd_x = VERTICAL_DISPLAY_MAP_START_OFFSET_X + x;
+                let nd_y = VERTICAL_DISPLAY_MAP_START_OFFSET_Y + y;
+
+                let nd_idx = (nd_y * nd_width + nd_x) * RENDERING_COLOR_CHANNEL_COUNT;
+                let vd_idx = (y * vd_width + x) * RENDERING_COLOR_CHANNEL_COUNT;
+
+                if nd_idx + 3 >= nd_frame.len() || vd_idx + 3 >= vd_frame.len() {
+                    continue;
+                }
+
+                // Alpha blending: VD pixels with alpha > 0 replace ND pixels
+                let vd_alpha = vd_frame[vd_idx + 3];
+                if vd_alpha > 0 {
+                    nd_frame[nd_idx] = vd_frame[vd_idx];
+                    nd_frame[nd_idx + 1] = vd_frame[vd_idx + 1];
+                    nd_frame[nd_idx + 2] = vd_frame[vd_idx + 2];
+                    nd_frame[nd_idx + 3] = vd_frame[vd_idx + 3];
+                }
+            }
+        }
+    }
+
+    /// Render the raw VD frame for transition (without compositing onto ND)
+    pub fn render_raw_vd_frame(&self, side: DisplaySide) -> Option<Vec<u8>> {
+        if !self.initialized {
+            return None;
+        }
+
+        // Check if VD terrain is enabled
+        let config = self.display_rendering.get(&side)?
+            .navigation_display.display_configuration().clone();
+
+        if !config.terr_on_vd {
+            return None;
+        }
+
+        // Need aircraft status for heading
+        let status = self.aircraft_status.as_ref()?;
+
+        // Render VD terrain to its own buffer
+        self.render_vertical_display_raw(side, status)
+    }
+
+    /// Check if VD terrain is enabled for a side
+    pub fn is_vd_enabled(&self, side: DisplaySide) -> bool {
+        self.display_rendering.get(&side)
+            .map(|s| s.navigation_display.display_configuration().terr_on_vd)
+            .unwrap_or(false)
+    }
+
+    /// Check if VD terrain should be rendered (enabled and required)
+    pub fn should_render_vd(&self, side: DisplaySide) -> bool {
+        self.vertical_display_required && self.is_vd_enabled(side)
     }
 
     /// Check if a display side needs a new render cycle immediately

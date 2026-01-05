@@ -294,6 +294,7 @@ impl SimConnectHandler {
 
             // Run transition tick at 40ms intervals (like TypeScript's setInterval)
             if !*paused && last_transition_tick.elapsed() >= transition_interval {
+                let tick_start = Instant::now();
                 last_transition_tick = Instant::now();
 
                 self.tick_transitions(
@@ -303,6 +304,11 @@ impl SimConnectHandler {
                     &frame_left,
                     &frame_right,
                 );
+
+                let tick_duration = tick_start.elapsed();
+                if tick_duration.as_millis() > 20 {
+                    log::debug!("Transition tick took {:?}", tick_duration);
+                }
             }
 
             // Small sleep to prevent busy waiting (target ~40ms tick rate)
@@ -345,6 +351,7 @@ impl SimConnectHandler {
         frame_left: &ClientDataArea<FrameDataChunk>,
         frame_right: &ClientDataArea<FrameDataChunk>,
     ) {
+        let side_tick_start = Instant::now();
         // Get current rendering state
         let (is_transitioning, elapsed) = {
             match self.rendering_state.get(&side) {
@@ -381,12 +388,13 @@ impl SimConnectHandler {
             if elapsed >= timeout || needs_immediate_cycle {
                 // Start a new rendering cycle
                 if needs_immediate_cycle {
-                    debug!("Starting immediate rendering cycle for {:?} (config changed)", side);
+                //    debug!("Starting immediate rendering cycle for {:?} (config changed)", side);
                 } else {
                     debug!("Starting new rendering cycle for {:?} (timeout)", side);
                 }
 
                 // Render raw RGBA frame for transitions
+                let render_cycle_start = Instant::now();
                 let frame_result = {
                     if let Ok(mut processor) = self.terrain_processor.write() {
                         processor.render_raw_frame_for_transition(side)
@@ -394,11 +402,23 @@ impl SimConnectHandler {
                         None
                     }
                 };
+                let render_cycle_duration = render_cycle_start.elapsed();
+                if render_cycle_duration.as_millis() > 10 {
+                    debug!("Raw render for new cycle took {:?}", render_cycle_duration);
+                }
 
                 if let Some((nav_data, raw_frame, width, height)) = frame_result {
-                    // Start the transition with raw RGBA frame and dimensions
+                    // Start the ND transition with raw RGBA frame and dimensions
                     if let Ok(mut processor) = self.terrain_processor.write() {
                         processor.start_transition_cycle(side, raw_frame, width, height);
+
+                        // Also render and start VD transition if VD is enabled
+                        if processor.should_render_vd(side) {
+                            if let Some(vd_frame) = processor.render_raw_vd_frame(side) {
+                                processor.start_vd_transition_cycle(side, vd_frame);
+                                debug!("Started VD transition for {:?}", side);
+                            }
+                        }
                     }
 
                     // Store dimensions and base metadata for encoding during transition
@@ -414,15 +434,37 @@ impl SimConnectHandler {
         }
 
         // We're transitioning - tick the transition
+        let render_start = Instant::now();
         let (transition_complete, current_frame) = {
             if let Ok(mut processor) = self.terrain_processor.write() {
-                let complete = processor.tick_transition(side);
-                let frame = processor.get_current_transition_frame(side);
-                (complete, frame)
+                let nd_complete = processor.tick_transition(side);
+                let vd_complete = processor.tick_vd_transition(side);
+                
+                // Get ND frame
+                let mut frame = processor.get_current_transition_frame(side);
+                
+                // If VD is enabled, composite VD onto ND frame
+                if processor.should_render_vd(side) {
+                    if let Some(vd_frame) = processor.get_current_vd_transition_frame(side) {
+                        if let Some(ref mut nd_frame) = frame {
+                            let (width, _height) = self.rendering_state.get(&side)
+                                .map(|s| s.frame_dimensions)
+                                .unwrap_or((768, 1000));
+                            processor.composite_vd_onto_nd(nd_frame, width, &vd_frame);
+                        }
+                    }
+                }
+                
+                // Transition complete when both ND and VD are done
+                (nd_complete && vd_complete, frame)
             } else {
                 (false, None)
             }
         };
+        let render_duration = render_start.elapsed();
+        if render_duration.as_millis() > 10 {
+            debug!("Transition render took {:?}", render_duration);
+        }
 
         // Get stored dimensions and metadata for encoding
         let (dimensions, base_metadata) = {
@@ -433,8 +475,12 @@ impl SimConnectHandler {
         };
 
         // Encode and send the current transition frame if available
+        let mut encode_duration = Duration::ZERO;
+        let mut send_duration = Duration::ZERO;
+
         if let Some(raw_frame) = current_frame {
             // Encode raw RGBA to PNG
+            let encode_start = Instant::now();
             let png_frame = {
                 if let Ok(processor) = self.terrain_processor.read() {
                     processor.encode_to_png(&raw_frame, dimensions.0, dimensions.1)
@@ -442,6 +488,10 @@ impl SimConnectHandler {
                     None
                 }
             };
+            encode_duration = encode_start.elapsed();
+            if encode_duration.as_millis() > 5 {
+                debug!("PNG encoding took {:?} for {}x{} frame", encode_duration, dimensions.0, dimensions.1);
+            }
 
             if let Some(png_data) = png_frame {
                 // Update metadata with actual PNG size and send
@@ -463,7 +513,7 @@ impl SimConnectHandler {
                     DisplaySide::Left => frame_left,
                     DisplaySide::Right => frame_right,
                 };
-                Self::send_frame_data_static(sim, frame_area, &png_data);
+                send_duration = Self::send_frame_data_static(sim, frame_area, &png_data);
             }
         }
 
@@ -477,6 +527,18 @@ impl SimConnectHandler {
                 state.base_metadata = None;
             }
         }
+
+        let side_tick_duration = side_tick_start.elapsed();
+        if side_tick_duration.as_millis() > 10 {
+            debug!(
+                "Side {:?} tick: total={:?}, render={:?}, encode={:?}, send={:?}",
+                side,
+                side_tick_duration,
+                render_duration,
+                encode_duration,
+                send_duration
+            );
+        }
     }
 
     /// Send frame data in chunks (static version to avoid borrow issues)
@@ -484,9 +546,9 @@ impl SimConnectHandler {
         sim: &mut Pin<Box<SimConnect>>,
         area: &ClientDataArea<FrameDataChunk>,
         frame: &[u8],
-    ) {
+    ) -> Duration {
+        let send_start = Instant::now();
         let chunks = (frame.len() + FRAME_CHUNK_SIZE - 1) / FRAME_CHUNK_SIZE;
-        debug!("Sending {} bytes in {} chunks (frame size: {})", frame.len(), chunks, FRAME_CHUNK_SIZE);
 
         for i in 0..chunks {
             let start = i * FRAME_CHUNK_SIZE;
@@ -501,6 +563,16 @@ impl SimConnectHandler {
                 break;
             }
         }
+        let send_duration = send_start.elapsed();
+        if send_duration.as_millis() > 5 {
+            debug!(
+                "SimConnect send took {:?} for {} bytes in {} chunks",
+                send_duration,
+                frame.len(),
+                chunks
+            );
+        }
+        send_duration
     }
 
     /// Set up client data areas
@@ -631,11 +703,11 @@ impl SimConnectHandler {
         buffer.data[12] = byte_count_bytes[2];
         buffer.data[13] = byte_count_bytes[3];
 
-        debug!("Packed metadata: min_elev={}, min_mode={:?}, max_elev={}, max_mode={:?}, first={}, range={}, mode={}, byte_count={}",
-            nav_data.minimum_elevation, nav_data.minimum_elevation_mode,
-            nav_data.maximum_elevation, nav_data.maximum_elevation_mode,
-            nav_data.first_frame, display_range, nav_data.display_mode, nav_data.frame_byte_count);
-        debug!("Metadata bytes: {:02x?}", &buffer.data);
+      //  debug!("Packed metadata: min_elev={}, min_mode={:?}, max_elev={}, max_mode={:?}, first={}, range={}, mode={}, byte_count={}",
+          //  nav_data.minimum_elevation, nav_data.minimum_elevation_mode,
+       //     nav_data.maximum_elevation, nav_data.maximum_elevation_mode,
+        //    nav_data.first_frame, display_range, nav_data.display_mode, nav_data.frame_byte_count);
+       // debug!("Metadata bytes: {:02x?}", &buffer.data);
 
         buffer
     }
