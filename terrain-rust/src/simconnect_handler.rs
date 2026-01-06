@@ -398,9 +398,11 @@ impl SimConnectHandler {
                 let frame_result = {
                     if let Ok(mut processor) = self.terrain_processor.write() {
                         processor.render_raw_frame_for_transition(side)
+
                     } else {
                         None
                     }
+
                 };
                 let render_cycle_duration = render_cycle_start.elapsed();
                 if render_cycle_duration.as_millis() > 10 {
@@ -409,6 +411,7 @@ impl SimConnectHandler {
 
                 if let Some((nav_data, raw_frame, width, height)) = frame_result {
                     // Start the ND transition with raw RGBA frame and dimensions
+
                     if let Ok(mut processor) = self.terrain_processor.write() {
                         processor.start_transition_cycle(side, raw_frame, width, height);
 
@@ -430,6 +433,8 @@ impl SimConnectHandler {
                     }
                 }
             }
+
+
             return;
         }
 
@@ -562,6 +567,7 @@ impl SimConnectHandler {
                 error!("Failed to send frame chunk {}: {:?}", i, e);
                 break;
             }
+
         }
         let send_duration = send_start.elapsed();
         if send_duration.as_millis() > 5 {
@@ -622,6 +628,7 @@ impl SimConnectHandler {
         info!("terr_enabled_fo: {}", terr_enabled_fo);
 
         let rendering_mode = buffer[37];
+        debug!("rendering_mode: {}", rendering_mode);
         let ground_truth_lat = f32::from_le_bytes([buffer[38], buffer[39], buffer[40], buffer[41]]) as f64;
         let ground_truth_lon = f32::from_le_bytes([buffer[42], buffer[43], buffer[44], buffer[45]]) as f64;
 

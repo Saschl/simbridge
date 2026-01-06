@@ -465,11 +465,12 @@ impl TerrainProcessor {
         let state = self.display_rendering.get(&side)?;
         let config = state.navigation_display.display_configuration();
 
-        debug!("render_raw_frame_with_stats({:?}): terr_on_nd={}, terr_on_vd={}, nd_range={}",
-            side, config.terr_on_nd, config.terr_on_vd, config.nd_range);
+        use std::time::{SystemTime, UNIX_EPOCH};
+     //   let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
 
-        if !config.terr_on_nd && !config.terr_on_vd {
-            debug!("Terrain not enabled for {:?}, skipping render", side);
+        if !config.terr_on_nd && !config.terr_on_vd && !self.vertical_display_required
+        {
+        //    debug!("Terrain not enabled for {:?}, skipping render", side);
             return None;
         }
 
@@ -1483,7 +1484,7 @@ impl TerrainProcessor {
             return None;
         }
 
-        // Check if terrain display is enabled
+        // Check if terrain display is enabled OR if A380X is connected (VD always renders)
         {
             let state = match self.display_rendering.get(&side) {
                 Some(s) => s,
@@ -1494,8 +1495,11 @@ impl TerrainProcessor {
             };
             let nd_config = state.navigation_display.display_configuration();
 
-            if !nd_config.terr_on_nd && !nd_config.terr_on_vd {
-                //debug!("Terrain display not enabled for {:?}", side);
+            // Continue if ND terrain is on, OR if A380X is connected (VD needs rendering)
+
+            if !nd_config.terr_on_nd && !self.vertical_display_required {
+                // FIXME !nd_config.terr_on_vd  check, comes from API http
+                info!("Terrain display not enabled for {:?}", side);
                 return None;
             }
         }
@@ -1779,13 +1783,12 @@ impl TerrainProcessor {
             return None;
         }
 
-        // Check if VD terrain is enabled
-        let config = self.display_rendering.get(&side)?
-            .navigation_display.display_configuration().clone();
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        debug!("[VD_RENDER] {}ms: render_raw_vd_frame({:?})", now, side);
 
-        if !config.terr_on_vd {
-            return None;
-        }
+        // VD always renders when A380X is connected (vertical_display_required)
+        // No need to check terr_on_vd configuration
 
         // Need aircraft status for heading
         let status = self.aircraft_status.as_ref()?;
@@ -1801,9 +1804,11 @@ impl TerrainProcessor {
             .unwrap_or(false)
     }
 
-    /// Check if VD terrain should be rendered (enabled and required)
+    /// Check if VD terrain should be rendered (A380X connected)
+    /// VD always renders when A380X is connected, regardless of terr_on_vd setting
     pub fn should_render_vd(&self, side: DisplaySide) -> bool {
-        self.vertical_display_required && self.is_vd_enabled(side)
+        // FIXME         self.vertical_display_required && self.is_vd_enabled(side)
+        self.vertical_display_required
     }
 
     /// Check if a display side needs a new render cycle immediately

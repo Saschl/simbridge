@@ -33,7 +33,7 @@ pub struct AppState {
 async fn main() -> std::io::Result<()> {
     // Initialize logging with debug level for our crate
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("simbridge_terrain=debug,info")
+        env_logger::Env::default().default_filter_or("simbridge_terrain=info")
     ).init();
 
     info!("SimBridge Terrain Service (Rust) starting...");
