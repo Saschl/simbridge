@@ -6,6 +6,9 @@
 mod renderer;
 mod patterns;
 
+/// Timeout for SimBridge client data (2 minutes in milliseconds)
+const SIMBRIDGE_CLIENT_DATA_TIMEOUT_MS: u128 = 2 * 60 * 1000;
+
 use patterns::{get_pattern_value, draw_density_pixel, ARC_MODE_PATTERN_WIDTH, ARC_MODE_PATTERN_HEIGHT, SCANLINE_MODE_PATTERN_WIDTH, SCANLINE_MODE_PATTERN_HEIGHT};
 
 use std::path::Path;
@@ -77,6 +80,10 @@ pub struct TerrainProcessor {
     cached_elevation_data: Option<CachedElevationData>,
     /// World map metadata
     world_map_metadata: WorldMapMetadata,
+    /// Flag indicating if web service is providing aircraft status (vs SimConnect)
+    simbridge_client_used: bool,
+    /// Timestamp of last web service aircraft status update
+    last_web_update: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -172,6 +179,8 @@ impl TerrainProcessor {
             startup_time,
             cached_elevation_data: None,
             world_map_metadata: WorldMapMetadata::default(),
+            simbridge_client_used: false,
+            last_web_update: None,
         })
     }
 
@@ -211,6 +220,8 @@ impl TerrainProcessor {
             startup_time,
             cached_elevation_data: None,
             world_map_metadata: WorldMapMetadata::default(),
+            simbridge_client_used: false,
+            last_web_update: None,
         }
     }
 
@@ -230,6 +241,43 @@ impl TerrainProcessor {
 
         self.cached_elevation_data = None;
         self.world_map_metadata = WorldMapMetadata::default();
+    }
+
+    /// Enable SimBridge client data mode (web service providing aircraft status)
+    /// This disables SimConnect aircraft status updates
+    pub fn enable_simbridge_client_data(&mut self) {
+        if !self.simbridge_client_used {
+            info!("SimBridge client data received, ignoring SimConnect aircraftStatusUpdate from now on.");
+        }
+        self.simbridge_client_used = true;
+        self.last_web_update = Some(Instant::now());
+    }
+
+    /// Disable SimBridge client data mode (resume SimConnect aircraft status updates)
+    pub fn disable_simbridge_client_data(&mut self) {
+        if self.simbridge_client_used {
+            info!("SimBridge client data stopped (due to timeout), resuming SimConnect aircraftStatusUpdate.");
+        }
+        self.simbridge_client_used = false;
+        self.last_web_update = None;
+    }
+
+    /// Check if SimConnect aircraft status updates should be processed
+    /// Returns false if web service is providing updates (and not timed out)
+    pub fn should_use_simconnect_status(&mut self) -> bool {
+        if !self.simbridge_client_used {
+            return true;
+        }
+
+        // Check for timeout
+        if let Some(last_update) = self.last_web_update {
+            if last_update.elapsed().as_millis() > SIMBRIDGE_CLIENT_DATA_TIMEOUT_MS {
+                self.disable_simbridge_client_data();
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Update position
@@ -1171,30 +1219,30 @@ impl TerrainProcessor {
         side: DisplaySide,
         status: &AircraftStatus,
     ) -> Option<Vec<u8>> {
-    /*     let cached_data = match &self.cached_elevation_data {
-            Some(data) => data,
-            None => {
-                debug!("render_vertical_display_raw: no cached elevation data");
-                return None;
-            }
-        }; */
-
         let metadata = &self.world_map_metadata;
         if metadata.width == 0 || metadata.height == 0 {
             debug!("render_vertical_display_raw: invalid world map metadata");
             return None;
         }
 
-        // Get vertical display configuration
-        let vd_config = match self.display_rendering.get(&side) {
-            Some(state) => state.vertical_display.display_configuration().clone(),
+        // Get vertical display state
+        let vd_state = match self.display_rendering.get(&side) {
+            Some(state) => &state.vertical_display,
             None => {
                 debug!("render_vertical_display_raw: no display state for {:?}", side);
                 return None;
             }
         };
 
-        // Get navigation display config for heading
+        let vd_config = vd_state.display_configuration().clone();
+        let waypoints_lat = vd_state.waypoints_latitudes().to_vec();
+        let waypoints_lon = vd_state.waypoints_longitudes().to_vec();
+        let path_width = vd_state.path_width();
+        let fms_path_used = vd_state.fms_path_used();
+        let track_changes_distance = vd_state.track_changes_significantly_at_distance();
+        let elevation_range_nm = vd_state.elevation_range();
+
+        // Get navigation display config for arc mode
         let nd_config = match self.display_rendering.get(&side) {
             Some(state) => state.navigation_display.display_configuration().clone(),
             None => return None,
@@ -1207,31 +1255,53 @@ impl TerrainProcessor {
 
         // Get elevation profile range (how far ahead to sample, in nm)
         // For arc mode, use nd_range; for rose mode, use nd_range / 2
-        let profile_range_nm = if nd_config.arc_mode {
+        let profile_range_nm = if elevation_range_nm > 0.0 {
+            elevation_range_nm
+        } else if nd_config.arc_mode {
             nd_config.nd_range.max(10).min(160) as f64
         } else {
             (nd_config.nd_range / 2).max(5).min(160) as f64
         };
 
-        // Create elevation profile along heading
-        let elevation_profile = self.create_elevation_profile(
-            status.latitude,
-            status.longitude,
-            status.heading as f64,
-            profile_range_nm,
-            vd_width,
-        );
+        // Create elevation profile - use waypoints if FMS path is active, otherwise use heading
+        let elevation_profile = if fms_path_used && !waypoints_lat.is_empty() {
+            self.create_elevation_profile_along_waypoints(
+                status.latitude,
+                status.longitude,
+                &waypoints_lat,
+                &waypoints_lon,
+                path_width,
+                profile_range_nm,
+                vd_width,
+            )
+        } else {
+            self.create_elevation_profile(
+                status.latitude,
+                status.longitude,
+                status.heading as f64,
+                profile_range_nm,
+                vd_width,
+            )
+        };
+
+        // Calculate grey area starting X position (where track changes significantly)
+        let grey_area_starts_at_x: i32 = if track_changes_distance >= 0.0 && fms_path_used {
+            // Convert distance to pixel X coordinate
+            ((track_changes_distance / profile_range_nm) * vd_width as f64) as i32
+        } else {
+            -1
+        };
 
         // Create buffer for VD
         let mut buffer = vec![0u8; vd_width * vd_height * RENDERING_COLOR_CHANNEL_COUNT];
 
-  // Render the vertical display
+        // Render the vertical display
         let altitude_range = (max_altitude - min_altitude) as f64;
         let altitude_step = altitude_range / vd_height as f64;
 
         for y in 0..vd_height {
             // Altitude at this row (top = max, bottom = min)
-            let altitude = (vd_height - y) as f64 * altitude_step + min_altitude as f64;
+            let altitude = (vd_height - y) as f64 * altitude_step + min_altitude;
 
             for x in 0..vd_width {
                 let elevation = elevation_profile[x];
@@ -1239,19 +1309,26 @@ impl TerrainProcessor {
                 // Calculate pixel position in the buffer
                 let buf_idx = (y * vd_width + x) * RENDERING_COLOR_CHANNEL_COUNT;
 
-
-
                 // Determine color based on elevation vs altitude
                 let (r, g, b, a) = if elevation == INVALID_ELEVATION as f32 || elevation == UNKNOWN_ELEVATION as f32 {
-                    // Unknown/invalid - magenta
+                    // Unknown/invalid - magenta (like TypeScript: 255, 148, 255)
                     (255u8, 148u8, 255u8, 255u8)
                 } else if altitude > elevation as f64 {
-                    // Above terrain - transparent background
-                    (0u8, 0u8, 0u8, 0u8)
+                    // Above terrain - check if in grey area or transparent
+                    if grey_area_starts_at_x >= 0 && (x as i32) >= grey_area_starts_at_x {
+                        // Grey background (like TypeScript: 78, 78, 97)
+                        (78u8, 78u8, 97u8, 255u8)
+                    } else {
+                        // Transparent background
+                        (0u8, 0u8, 0u8, 0u8)
+                    }
                 } else if elevation == WATER_ELEVATION as f32 {
-                    // Water - cyan if at/below sea level
+                    // Water - cyan if at/below sea level (like TypeScript: 0, 255, 255)
                     if altitude <= 0.0 {
                         (0u8, 255u8, 255u8, 255u8)
+                    } else if grey_area_starts_at_x >= 0 && (x as i32) >= grey_area_starts_at_x {
+                        // Grey background above water in grey area
+                        (78u8, 78u8, 97u8, 255u8)
                     } else {
                         (0u8, 0u8, 0u8, 0u8)
                     }
@@ -1267,7 +1344,8 @@ impl TerrainProcessor {
             }
         }
 
-        debug!("Vertical display raw rendering complete for {:?}", side);
+        debug!("Vertical display raw rendering complete for {:?}, fms_path={}, waypoints={}, grey_area_x={}", 
+               side, fms_path_used, waypoints_lat.len(), grey_area_starts_at_x);
         Some(buffer)
     }
 
@@ -1384,7 +1462,116 @@ impl TerrainProcessor {
         debug!("Vertical display rendering complete for {:?}", side);
     }
 
-    /// Create an elevation profile along the aircraft heading
+    /// Create an elevation profile along waypoints (FMS path) or heading (manual azimuth)
+    /// Uses a corridor/hose around the path and returns the maximum elevation in the corridor
+    /// This matches the TypeScript createElevationProfile GPU kernel behavior
+    fn create_elevation_profile_along_waypoints(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        waypoints_lat: &[f64],
+        waypoints_lon: &[f64],
+        path_width_nm: f64,
+        range_nm: f64,
+        profile_width: usize,
+    ) -> Vec<f32> {
+        let mut profile = vec![INVALID_ELEVATION as f32; profile_width];
+
+        let cached_data = match &self.cached_elevation_data {
+            Some(data) => data,
+            None => return profile,
+        };
+
+        let metadata = &self.world_map_metadata;
+        if metadata.width == 0 || metadata.height == 0 {
+            return profile;
+        }
+
+        let waypoint_count = waypoints_lat.len();
+        if waypoint_count == 0 {
+            return profile;
+        }
+
+        // Calculate distance per pixel in nautical miles
+        let distance_per_pixel_nm = range_nm / profile_width as f64;
+        
+        // Path offset in metres (half-width of corridor)
+        let offset_meters = (path_width_nm * NAUTICAL_MILES_TO_METRES) / 2.0;
+
+        // Calculate lat/lon steps for the world map
+        let lat_step = (metadata.northeast.latitude - metadata.southwest.latitude) / metadata.height as f64;
+        let lon_step = (metadata.northeast.longitude - metadata.southwest.longitude) / metadata.width as f64;
+
+        for x in 0..profile_width {
+            let distance_for_pixel_nm = distance_per_pixel_nm * x as f64;
+            
+            // Find the correct waypoint segment for this distance
+            let mut route_segment_index = waypoint_count;
+            let mut route_start_point_distance_nm = 0.0;
+            let mut start_latitude = latitude;
+            let mut start_longitude = longitude;
+
+            for i in 0..waypoint_count {
+                let current_distance_nm = Self::distance_wgs84_nm(
+                    start_latitude, start_longitude,
+                    waypoints_lat[i], waypoints_lon[i]
+                );
+                
+                if route_start_point_distance_nm + current_distance_nm >= distance_for_pixel_nm {
+                    route_segment_index = i;
+                    break;
+                }
+
+                route_start_point_distance_nm += current_distance_nm;
+                start_latitude = waypoints_lat[i];
+                start_longitude = waypoints_lon[i];
+            }
+
+            // Check if we exceeded the waypoints
+            if route_segment_index >= waypoint_count {
+                // Leave as invalid - beyond the route
+                continue;
+            }
+
+            // Get the required projection of latitude, longitude
+            let remaining_distance_m = (distance_for_pixel_nm - route_start_point_distance_nm) * NAUTICAL_MILES_TO_METRES;
+            let bearing = Self::bearing_wgs84(
+                start_latitude, start_longitude,
+                waypoints_lat[route_segment_index], waypoints_lon[route_segment_index]
+            );
+            
+            let (center_lat, center_lon) = Self::project_wgs84(
+                start_latitude, start_longitude, bearing, remaining_distance_m
+            );
+
+            // Calculate perpendicular bearings for corridor sampling
+            let mut bearing_start = bearing - 90.0;
+            if bearing_start < 0.0 { bearing_start += 360.0; }
+            let mut bearing_end = bearing + 90.0;
+            if bearing_end >= 360.0 { bearing_end -= 360.0; }
+
+            // Project to corridor endpoints
+            let (start_lat, start_lon) = Self::project_wgs84(center_lat, center_lon, bearing_start, offset_meters);
+            let (end_lat, end_lon) = Self::project_wgs84(center_lat, center_lon, bearing_end, offset_meters);
+
+            // Convert to pixel coordinates
+            let start_pixel = self.wgs84_to_pixel(start_lat, start_lon, lat_step, lon_step);
+            let end_pixel = self.wgs84_to_pixel(end_lat, end_lon, lat_step, lon_step);
+
+            // Use Bresenham line algorithm to find max elevation along corridor
+            let max_elevation = self.sample_line_max_elevation(
+                cached_data,
+                start_pixel,
+                end_pixel,
+            );
+
+            profile[x] = max_elevation;
+        }
+
+        profile
+    }
+
+    /// Create an elevation profile along the aircraft heading (fallback for manual azimuth)
     /// Returns a vector of elevations (one per pixel width)
     fn create_elevation_profile(
         &self,
@@ -1439,6 +1626,98 @@ impl TerrainProcessor {
         }
 
         profile
+    }
+
+    /// Convert WGS84 coordinates to pixel coordinates in cached elevation data
+    fn wgs84_to_pixel(&self, lat: f64, lon: f64, lat_step: f64, lon_step: f64) -> (i32, i32) {
+        let metadata = &self.world_map_metadata;
+        let x = ((lon - metadata.southwest.longitude) / lon_step) as i32;
+        let y = ((metadata.northeast.latitude - lat) / lat_step) as i32;
+        (x, y)
+    }
+
+    /// Sample a line using Bresenham algorithm and return max elevation
+    fn sample_line_max_elevation(
+        &self,
+        cached_data: &CachedElevationData,
+        start: (i32, i32),
+        end: (i32, i32),
+    ) -> f32 {
+        let metadata = &self.world_map_metadata;
+        let mut max_elevation = -1000.0f32;
+
+        let delta_x = (end.0 - start.0).abs();
+        let step_x = if start.0 < end.0 { 1 } else { -1 };
+        let delta_y = -(end.1 - start.1).abs();
+        let step_y = if start.1 < end.1 { 1 } else { -1 };
+        let mut error = delta_x + delta_y;
+
+        let mut x = start.0;
+        let mut y = start.1;
+
+        loop {
+            // Check bounds and sample
+            if y >= 0 && (y as usize) < metadata.height && x >= 0 && (x as usize) < metadata.width {
+                let idx = (y as usize) * metadata.width + (x as usize);
+                if idx < cached_data.data.len() {
+                    let elevation = cached_data.data[idx];
+                    // Skip invalid and unknown for max calculation
+                    if elevation != INVALID_ELEVATION as f32 
+                        && elevation != UNKNOWN_ELEVATION as f32 
+                        && elevation > max_elevation 
+                    {
+                        max_elevation = elevation;
+                    }
+                }
+            }
+
+            if x == end.0 && y == end.1 {
+                break;
+            }
+
+            let error_double = 2 * error;
+            if error_double >= delta_y {
+                if x == end.0 { break; }
+                error += delta_y;
+                x += step_x;
+            }
+            if error_double <= delta_x {
+                if y == end.1 { break; }
+                error += delta_x;
+                y += step_y;
+            }
+        }
+
+        max_elevation
+    }
+
+    /// Calculate distance between two WGS84 points in nautical miles
+    fn distance_wgs84_nm(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+        let delta_lat = (lat2 - lat1).to_radians();
+        let delta_lon = (lon2 - lon1).to_radians();
+        let lat1_rad = lat1.to_radians();
+        let lat2_rad = lat2.to_radians();
+
+        let a = 0.5 - delta_lat.cos() * 0.5
+            + lat1_rad.cos() * lat2_rad.cos() * (1.0 - delta_lon.cos()) * 0.5;
+        
+        let distance_metres = 12742020.0 * a.sqrt().asin();
+        distance_metres / NAUTICAL_MILES_TO_METRES
+    }
+
+    /// Calculate bearing between two WGS84 points in degrees
+    fn bearing_wgs84(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+        let start_lat = lat1.to_radians();
+        let start_lon = lon1.to_radians();
+        let end_lat = lat2.to_radians();
+        let end_lon = lon2.to_radians();
+
+        let y = (end_lon - start_lon).sin() * end_lat.cos();
+        let x = start_lat.cos() * end_lat.sin()
+            - start_lat.sin() * end_lat.cos() * (end_lon - start_lon).cos();
+        
+        let bearing = y.atan2(x).to_degrees();
+        (bearing + 360.0) % 360.0
     }
 
     /// Determine terrain color based on pre-calculated thresholds

@@ -265,7 +265,10 @@ impl SimConnectHandler {
                             status.efis_data_capt.efis_mode);
 
                         if let Ok(mut processor) = self.terrain_processor.write() {
-                            processor.aircraft_status_update(status.clone());
+                            // Only process SimConnect updates if web service is not providing updates
+                            if processor.should_use_simconnect_status() {
+                                processor.aircraft_status_update(status.clone());
+                            }
                         }
                     }
                     SimConnectMessage::SimulatorRunning(running) => {
@@ -306,9 +309,9 @@ impl SimConnectHandler {
                 );
 
                 let tick_duration = tick_start.elapsed();
-                if tick_duration.as_millis() > 20 {
+               /*  if tick_duration.as_millis() > 20 {
                     log::debug!("Transition tick took {:?}", tick_duration);
-                }
+                } */
             }
 
             // Small sleep to prevent busy waiting (target ~40ms tick rate)
@@ -494,9 +497,9 @@ impl SimConnectHandler {
                 }
             };
             encode_duration = encode_start.elapsed();
-            if encode_duration.as_millis() > 5 {
+           /*  if encode_duration.as_millis() > 5 {
                 debug!("PNG encoding took {:?} for {}x{} frame", encode_duration, dimensions.0, dimensions.1);
-            }
+            } */
 
             if let Some(png_data) = png_frame {
                 // Update metadata with actual PNG size and send
@@ -535,14 +538,14 @@ impl SimConnectHandler {
 
         let side_tick_duration = side_tick_start.elapsed();
         if side_tick_duration.as_millis() > 10 {
-            debug!(
+           /*  debug!(
                 "Side {:?} tick: total={:?}, render={:?}, encode={:?}, send={:?}",
                 side,
                 side_tick_duration,
                 render_duration,
                 encode_duration,
                 send_duration
-            );
+            ); */
         }
     }
 
@@ -606,9 +609,9 @@ impl SimConnectHandler {
         let adiru_data_valid = buffer[0] != 0;
         let latitude = f32::from_le_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as f64;
         let longitude = f32::from_le_bytes([buffer[5], buffer[6], buffer[7], buffer[8]]) as f64;
-        let altitude = i32::from_le_bytes([buffer[9], buffer[10], buffer[11], buffer[12]]);
-        let heading = i16::from_le_bytes([buffer[13], buffer[14]]);
-        let vertical_speed = i16::from_le_bytes([buffer[15], buffer[16]]);
+        let altitude = i32::from_le_bytes([buffer[9], buffer[10], buffer[11], buffer[12]]) as f64;
+        let heading = i16::from_le_bytes([buffer[13], buffer[14]]) as f64;
+        let vertical_speed = i16::from_le_bytes([buffer[15], buffer[16]]) as f64;
         let gear_is_down = buffer[17] != 0;
         let runway_data_valid = buffer[18] != 0;
         let runway_latitude = f32::from_le_bytes([buffer[19], buffer[20], buffer[21], buffer[22]]) as f64;
@@ -625,7 +628,6 @@ impl SimConnectHandler {
         let arc_mode_fo = buffer[34] != 0;
         let terr_enabled_fo = buffer[35] != 0;
         let efis_mode_fo = buffer[36];
-        info!("terr_enabled_fo: {}", terr_enabled_fo);
 
         let rendering_mode = buffer[37];
         debug!("rendering_mode: {}", rendering_mode);
@@ -650,8 +652,8 @@ impl SimConnectHandler {
                 terr_on_nd: terr_enabled_capt,
                 terr_on_vd: terr_enabled_capt,
                 efis_mode: efis_mode_capt,
-                vd_range_lower: -500,
-                vd_range_upper: 24000,
+                vd_range_lower: -500.,
+                vd_range_upper: 24000.,
                 ..Default::default()
             },
             efis_data_fo: EfisData {
@@ -660,13 +662,13 @@ impl SimConnectHandler {
                 terr_on_nd: terr_enabled_fo,
                 terr_on_vd: terr_enabled_fo,
                 efis_mode: efis_mode_fo,
-                vd_range_lower: -500,
-                vd_range_upper: 24500,
+                vd_range_lower: -500.,
+                vd_range_upper: 24500.,
                 ..Default::default()
             },
             navigation_display_rendering_mode: rendering_mode,
             manual_azim_enabled: true,
-            manual_azim_degrees: heading as u16,
+            manual_azim_degrees: heading,
             ground_truth_latitude: ground_truth_lat,
             ground_truth_longitude: ground_truth_lon,
         }

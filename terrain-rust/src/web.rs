@@ -101,6 +101,9 @@ async fn aircraft_status_data(
         }
     };
 
+    // Enable SimBridge client mode and update last web update timestamp
+    processor.enable_simbridge_client_data();
+
     let status = body.into_inner().into();
 
     processor.aircraft_status_update(status);

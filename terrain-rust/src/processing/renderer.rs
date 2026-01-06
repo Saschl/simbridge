@@ -850,6 +850,16 @@ impl VerticalDisplayRenderer {
         self.elevation_config.range
     }
 
+    /// Get the distance at which track changes significantly (for grey area rendering)
+    pub fn track_changes_significantly_at_distance(&self) -> f64 {
+        self.elevation_config.track_changes_significantly_at_distance
+    }
+
+    /// Check if FMS path is being used (vs manual azimuth)
+    pub fn fms_path_used(&self) -> bool {
+        self.elevation_config.fms_path_used
+    }
+
     /// Start a new map rendering cycle for vertical display
     pub fn start_new_map_cycle(&mut self, current_time: Instant) {
         let map_width = self.display_config.map_width as usize;
