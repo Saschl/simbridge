@@ -2,9 +2,6 @@
 //!
 //! This module handles terrain rendering for both navigation and vertical displays.
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
 
 mod renderer;
 mod patterns;
@@ -104,25 +101,25 @@ struct WorldMapMetadata {
 #[derive(Debug, Clone, Copy)]
 struct RenderingThresholds {
     /// Low density green threshold (lowest rendered terrain in normal mode)
-    low_density_green: i32,
+    low_density_green: f64,
     /// High density green threshold
-    high_density_green: i32,
+    high_density_green: f64,
     /// Low density yellow threshold
-    low_density_yellow: i32,
+    low_density_yellow: f64,
     /// High density yellow threshold
-    high_density_yellow: i32,
+    high_density_yellow: f64,
     /// High density red threshold
-    high_density_red: i32,
+    high_density_red: f64,
     /// Cutoff altitude (terrain below this is not rendered)
-    cutoff_altitude: i32,
+    cutoff_altitude: f64,
     /// Reference altitude (aircraft altitude with vertical speed prediction)
-    reference_altitude: i32,
+    reference_altitude: f64,
     /// Whether we're in normal mode (vs peaks mode)
     use_normal_mode: bool,
     /// Raw min elevation from terrain data
-    min_elevation: i32,
+    min_elevation: f64,
     /// Raw max elevation from terrain data
-    max_elevation: i32,
+    max_elevation: f64,
 }
 
 impl TerrainProcessor {
@@ -246,6 +243,8 @@ impl TerrainProcessor {
             return;
         }
 
+
+    info!("aircraft status update {}", status.efis_data_capt.vd_range_upper);
         // Update rendering mode
         self.vertical_display_required =
             (status.navigation_display_rendering_mode & TerrainRenderingMode::VerticalDisplayRequired as u8) != 0;
@@ -257,7 +256,7 @@ impl TerrainProcessor {
         };
 
         self.manual_azim_enabled = status.manual_azim_enabled;
-        self.manual_azim_degrees = status.manual_azim_degrees as f64;
+        self.manual_azim_degrees = status.manual_azim_degrees;
 
         // Update position
         let position = PositionData {
@@ -461,7 +460,7 @@ impl TerrainProcessor {
     /// Render navigation display frame and return (frame_data, min_for_display, max_for_display, is_normal_mode)
     /// Render raw RGBA frame with elevation stats (no PNG encoding)
     /// Returns (raw_rgba_frame, min_elevation, max_elevation, is_normal_mode, width, height)
-    fn render_raw_frame_with_stats(&mut self, side: DisplaySide) -> Option<(Vec<u8>, i32, i32, bool, usize, usize)> {
+    fn render_raw_frame_with_stats(&mut self, side: DisplaySide) -> Option<(Vec<u8>, f64, f64, bool, usize, usize)> {
         let state = self.display_rendering.get(&side)?;
         let config = state.navigation_display.display_configuration();
 
@@ -521,7 +520,7 @@ impl TerrainProcessor {
                 config.map_height.unwrap_or(NAVIGATION_DISPLAY_MAX_PIXEL_HEIGHT as u32) as usize,
             )
         } else {
-            (0, 0, false)
+            (0.0, 0.0, false)
         };
 
         // NOTE: Vertical display is rendered separately with its own transition
@@ -530,7 +529,7 @@ impl TerrainProcessor {
         Some((frame, min_elev, max_elev, is_normal_mode, display_width, display_height))
     }
 
-    fn render_navigation_display_frame_with_stats(&mut self, side: DisplaySide) -> Option<(Vec<u8>, i32, i32, bool)> {
+    fn render_navigation_display_frame_with_stats(&mut self, side: DisplaySide) -> Option<(Vec<u8>, f64, f64, bool)> {
         let (frame, min_elev, max_elev, is_normal_mode, display_width, display_height) =
             self.render_raw_frame_with_stats(side)?;
 
@@ -611,19 +610,19 @@ impl TerrainProcessor {
         offset_y: usize,
         map_width: usize,
         map_height: usize,
-    ) -> (i32, i32, bool) {
+    ) -> (f64, f64, bool) {
         let cached_data = match &self.cached_elevation_data {
             Some(data) => data,
             None => {
                 warn!("render_terrain_to_frame: no cached elevation data");
-                return (0, 0, false);
+                return (0.0, 0.0, false);
             }
         };
 
         let metadata = &self.world_map_metadata;
         if metadata.width == 0 || metadata.height == 0 {
             warn!("render_terrain_to_frame: invalid world map metadata ({}x{})", metadata.width, metadata.height);
-            return (0, 0, false);
+            return (0.0, 0.0, false);
         }
 
         let config = self.display_rendering.get(&side)
@@ -646,7 +645,7 @@ impl TerrainProcessor {
 
         let aircraft_lat = status.latitude;
         let aircraft_lon = status.longitude;
-        let heading = status.heading as f64;
+        let heading = status.heading;
 
         // Calculate degrees per pixel for the world map
         let lat_step = (metadata.northeast.latitude - metadata.southwest.latitude) / metadata.height as f64;
@@ -777,7 +776,7 @@ impl TerrainProcessor {
         let mut upper_percentile_bin: i32 = -1;
         let mut cumulative_percent = 0.0f64;
 
-        let cutoff_altitude = HISTOGRAM_MINIMUM_ELEVATION; // -500
+        let cutoff_altitude = HISTOGRAM_MINIMUM_ELEVATION as f64; // -500
         let cutoff_bin = 0i32; // First bin (for elevations >= -500)
 
         for bin in cutoff_bin as usize..histogram.len() {
@@ -805,62 +804,61 @@ impl TerrainProcessor {
         };
 
         // Use binned values for mode calculations
-        let min_elevation = min_elevation_binned;
-        let max_elevation = max_elevation_binned;
+        let min_elevation = min_elevation_binned as f64;
+        let max_elevation = max_elevation_binned as f64;
 
         // Calculate reference altitude with vertical speed prediction (like TypeScript)
-        let reference_altitude = if status.vertical_speed <= -1000 {
-            status.altitude + (status.vertical_speed as i32 / 2)
+        let reference_altitude = if status.vertical_speed <= -1000.0 {
+            status.altitude + (status.vertical_speed / 2.0)
         } else {
             status.altitude
         };
 
-        let gear_offset = if status.gear_is_down { 250 } else { 500 };
+        let gear_offset = if status.gear_is_down { 250.0 } else { 500.0 };
         let use_normal_mode = max_elevation >= reference_altitude - gear_offset;
 
         // Calculate thresholds like TypeScript
         // These are the same values used in elevation_to_color_with_thresholds
-        const LOW_DENSITY_GREEN_OFFSET: i32 = 2000;
-        const HIGH_DENSITY_GREEN_OFFSET: i32 = 1000;
-        const HIGH_DENSITY_YELLOW_OFFSET: i32 = 1000;
-        const HIGH_DENSITY_RED_OFFSET: i32 = 2000;
-        const FLAT_EARTH_THRESHOLD: i32 = 100;
-
+        const LOW_DENSITY_GREEN_OFFSET: f64 = 2000. ;
+        const HIGH_DENSITY_GREEN_OFFSET: f64 = 1000.;
+        const HIGH_DENSITY_YELLOW_OFFSET: f64 = 1000.;
+        const HIGH_DENSITY_RED_OFFSET: f64 = 2000.;
+        const FLAT_EARTH_THRESHOLD: f64 = 100.;
         // Calculate flatEarth like TypeScript: flatEarthThreshold - (maxElevation - minElevation)
         let flat_earth = FLAT_EARTH_THRESHOLD - (max_elevation - min_elevation);
-        let half_elevation = (max_elevation as f64 * 0.5) as i32;
+        let half_elevation = (max_elevation as f64 * 0.5);
 
         // Calculate green thresholds (from calculateNormalModeGreenThresholds)
         let mut low_density_green = if reference_altitude - LOW_DENSITY_GREEN_OFFSET <= min_elevation {
-            min_elevation + 200
+            min_elevation + 200.
         } else {
             reference_altitude - LOW_DENSITY_GREEN_OFFSET
         };
 
         let high_density_green = if reference_altitude - HIGH_DENSITY_GREEN_OFFSET <= min_elevation {
-            min_elevation + 200
+            min_elevation + 200.
         } else {
             reference_altitude - HIGH_DENSITY_GREEN_OFFSET
         };
 
         // Apply flatEarth adjustments like TypeScript using actual percentile values
         // TypeScript: lowerPercentile is the elevation at 85th percentile of terrain
-        if flat_earth >= 0 {
-            if half_elevation <= lower_percentile_elev && low_density_green > half_elevation {
+        if flat_earth >= 0. {
+            if half_elevation <= lower_percentile_elev as f64&& low_density_green > half_elevation {
                 low_density_green = half_elevation;
-            } else if half_elevation > lower_percentile_elev && low_density_green > lower_percentile_elev {
-                low_density_green = lower_percentile_elev;
+            } else if half_elevation > lower_percentile_elev as f64 && low_density_green > lower_percentile_elev as f64{
+                low_density_green = lower_percentile_elev as f64;
             }
         }
 
         // Warning thresholds
-        let low_density_yellow = if reference_altitude - gear_offset <= min_elevation {
-            min_elevation + 200
+        let low_density_yellow = if reference_altitude - gear_offset <= min_elevation as f64 {
+            min_elevation as f64 + 200.
         } else {
             reference_altitude - gear_offset
         };
-        let high_density_yellow = reference_altitude + HIGH_DENSITY_YELLOW_OFFSET;
-        let high_density_red = reference_altitude + HIGH_DENSITY_RED_OFFSET;
+        let high_density_yellow = reference_altitude + HIGH_DENSITY_YELLOW_OFFSET as f64;
+        let high_density_red = reference_altitude + HIGH_DENSITY_RED_OFFSET as f64;
 
         // Create thresholds struct for consistent use in coloring and metadata
         let thresholds = RenderingThresholds {
@@ -1049,12 +1047,12 @@ impl TerrainProcessor {
 
         // Bin to histogram boundaries like TypeScript
         // min: floor to bin boundary
-        let min_bin = (min_raw - HISTOGRAM_MINIMUM_ELEVATION) / HISTOGRAM_BIN_RANGE;
-        let min_for_display = min_bin * HISTOGRAM_BIN_RANGE + HISTOGRAM_MINIMUM_ELEVATION;
+        let min_bin = (min_raw - HISTOGRAM_MINIMUM_ELEVATION as f64) / HISTOGRAM_BIN_RANGE as f64;
+        let min_for_display = min_bin * HISTOGRAM_BIN_RANGE as f64 + HISTOGRAM_MINIMUM_ELEVATION as f64;
 
         // max: ceil to next bin boundary (bin + 1)
-        let max_bin = (thresholds.max_elevation - HISTOGRAM_MINIMUM_ELEVATION) / HISTOGRAM_BIN_RANGE;
-        let max_for_display = (max_bin + 1) * HISTOGRAM_BIN_RANGE + HISTOGRAM_MINIMUM_ELEVATION;
+        let max_bin = (thresholds.max_elevation - HISTOGRAM_MINIMUM_ELEVATION as f64) / HISTOGRAM_BIN_RANGE as f64;
+        let max_for_display = (max_bin + 1.) * HISTOGRAM_BIN_RANGE as f64 + HISTOGRAM_MINIMUM_ELEVATION as f64;
 
         (min_for_display, max_for_display, thresholds.use_normal_mode)
     }
@@ -1066,13 +1064,13 @@ impl TerrainProcessor {
         side: DisplaySide,
         status: &AircraftStatus,
     ) -> Option<Vec<u8>> {
-        let cached_data = match &self.cached_elevation_data {
+    /*     let cached_data = match &self.cached_elevation_data {
             Some(data) => data,
             None => {
                 debug!("render_vertical_display_raw: no cached elevation data");
                 return None;
             }
-        };
+        }; */
 
         let metadata = &self.world_map_metadata;
         if metadata.width == 0 || metadata.height == 0 {
@@ -1120,7 +1118,7 @@ impl TerrainProcessor {
         // Create buffer for VD
         let mut buffer = vec![0u8; vd_width * vd_height * RENDERING_COLOR_CHANNEL_COUNT];
 
-        // Render the vertical display
+  // Render the vertical display
         let altitude_range = (max_altitude - min_altitude) as f64;
         let altitude_step = altitude_range / vd_height as f64;
 
@@ -1259,10 +1257,10 @@ impl TerrainProcessor {
                     // Water - cyan if at/below sea level
                     if altitude <= 0.0 {
                         (0u8, 255u8, 255u8, 255u8)
-                    } else {
+            } else {
                         (0u8, 0u8, 0u8, 0u8)
-                    }
-                } else {
+            }
+        } else {
                     // Terrain/obstacle - brown color (like TypeScript: 110, 51, 14)
                     (110u8, 51u8, 14u8, 255u8)
                 };
@@ -1316,8 +1314,8 @@ impl TerrainProcessor {
             // Check if within cached map bounds
             if proj_lat < metadata.southwest.latitude || proj_lat > metadata.northeast.latitude ||
                proj_lon < metadata.southwest.longitude || proj_lon > metadata.northeast.longitude {
-                continue; // Leave as invalid
-            }
+                    continue; // Leave as invalid
+                }
 
             // Convert to pixel coordinates in cached data
             let sample_x = ((proj_lon - metadata.southwest.longitude) / lon_step) as usize;
@@ -1325,10 +1323,10 @@ impl TerrainProcessor {
 
             if sample_x < metadata.width && sample_y < metadata.height {
                 let elevation_idx = sample_y * metadata.width + sample_x;
-                if elevation_idx < cached_data.data.len() {
+                    if elevation_idx < cached_data.data.len() {
                     profile[x] = cached_data.data[elevation_idx];
-                }
             }
+        }
         }
 
         profile
@@ -1361,7 +1359,7 @@ impl TerrainProcessor {
         let elevation_ft = elevation as i32;
 
         // TypeScript: check elevation >= absoluteCutOffAltitude before rendering colors
-        if elevation_ft < thresholds.cutoff_altitude {
+        if elevation_ft < thresholds.cutoff_altitude as i32 {
             return (0, 0, 0, 254);
         }
 
@@ -1374,19 +1372,19 @@ impl TerrainProcessor {
             // 4. elevation >= warningThresholds[0] (low_density_yellow) AND elevation < warningThresholds[1] (high_density_yellow) -> yellow low density
             // 5. elevation >= greenThresholds[0] (low_density_green) AND elevation < greenThresholds[1] (high_density_green) -> green low density
 
-            if elevation_ft >= thresholds.high_density_red {
+            if elevation_ft >= thresholds.high_density_red  as i32 {
                 // High density red - immediate danger (pattern index 5)
                 (255, 0, 0, 5)
-            } else if elevation_ft >= thresholds.high_density_yellow {
+            } else if elevation_ft >= thresholds.high_density_yellow as i32{
                 // High density yellow - caution (pattern index 5)
                 (255, 255, 50, 5)
-            } else if elevation_ft >= thresholds.high_density_green && elevation_ft < thresholds.low_density_yellow {
+            } else if elevation_ft >= thresholds.high_density_green as i32 && elevation_ft < thresholds.low_density_yellow as i32{
                 // High density green - terrain close but below (pattern index 5)
                 (0, 255, 0, 5)
-            } else if elevation_ft >= thresholds.low_density_yellow && elevation_ft < thresholds.high_density_yellow {
+            } else if elevation_ft >= thresholds.low_density_yellow as i32 && elevation_ft < thresholds.high_density_yellow as i32{
                 // Low density yellow - approaching caution level (pattern index 3)
                 (255, 255, 50, 3)
-            } else if elevation_ft >= thresholds.low_density_green && elevation_ft < thresholds.high_density_green {
+            } else if elevation_ft >= thresholds.low_density_green as i32 && elevation_ft < thresholds.high_density_green as i32{
                 // Low density green - safe terrain (pattern index 3)
                 (0, 255, 0, 3)
             } else {
@@ -1397,21 +1395,21 @@ impl TerrainProcessor {
             // PEAKS MODE - terrain is well below aircraft, show terrain relief
             // Calculate thresholds based on terrain distribution
             let elevation_range = thresholds.max_elevation - thresholds.min_elevation;
-            let half_elevation = (thresholds.max_elevation + thresholds.min_elevation) / 2;
+            let half_elevation = (thresholds.max_elevation + thresholds.min_elevation) / 2.;
 
             // Calculate density thresholds (from calculatePeaksModeThresholds)
             let lower_density = half_elevation;
-            let higher_density = thresholds.min_elevation + (elevation_range as f64 * 0.65) as i32;
-            let solid_density = thresholds.min_elevation + (elevation_range as f64 * 0.95) as i32;
+            let higher_density = thresholds.min_elevation  + (elevation_range as f64 * 0.65);
+            let solid_density = thresholds.min_elevation + (elevation_range as f64 * 0.95) ;
 
             // Determine color based on elevation relative to terrain distribution
-            if elevation_ft >= solid_density {
+            if elevation_ft >= solid_density as i32{
                 // Solid green - highest peaks (solid, no pattern)
                 (0, 255, 0, 255)
-            } else if elevation_ft >= higher_density {
+            } else if elevation_ft >= higher_density as i32  {
                 // High density green (pattern index 5)
                 (0, 255, 0, 5)
-            } else if elevation_ft >= lower_density {
+            } else if elevation_ft >= lower_density as i32 {
                 // Low density green (pattern index 3)
                 (0, 255, 0, 3)
             } else {
@@ -1499,7 +1497,7 @@ impl TerrainProcessor {
 
             if !nd_config.terr_on_nd && !self.vertical_display_required {
                 // FIXME !nd_config.terr_on_vd  check, comes from API http
-                info!("Terrain display not enabled for {:?}", side);
+                debug!("Terrain display not enabled for {:?}", side);
                 return None;
             }
         }
@@ -1511,16 +1509,16 @@ impl TerrainProcessor {
         // Calculate elevation modes
         let (min_mode, max_mode) = {
             let status = self.aircraft_status.as_ref()?;
-            let gear_offset = if status.gear_is_down { 250 } else { 500 };
+            let gear_offset = if status.gear_is_down { 250.0 } else { 500.0 };
 
-            let reference_altitude = if status.vertical_speed <= -1000 {
-                status.altitude + (status.vertical_speed as i32 / 2)
+            let reference_altitude = if status.vertical_speed <= -1000.0 {
+                status.altitude + (status.vertical_speed / 2.0)
             } else {
                 status.altitude
             };
 
-            const HIGH_DENSITY_GREEN_OFFSET: i32 = 1000;
-            const HIGH_DENSITY_RED_OFFSET: i32 = 2000;
+            const HIGH_DENSITY_GREEN_OFFSET: f64 = 1000.0;
+            const HIGH_DENSITY_RED_OFFSET: f64 = 2000.0;
 
             if is_normal_mode {
                 let high_density_green = reference_altitude - HIGH_DENSITY_GREEN_OFFSET;
@@ -1533,7 +1531,7 @@ impl TerrainProcessor {
                     TerrainLevelMode::PeaksMode
                 };
 
-                let max_mode = if max_for_display >= high_density_red {
+                let max_mode = if max_for_display as f64 >= high_density_red {
                     TerrainLevelMode::Caution
                 } else {
                     TerrainLevelMode::Warning
@@ -1613,18 +1611,18 @@ impl TerrainProcessor {
         // Calculate elevation modes based on thresholds and aircraft altitude
         let (min_mode, max_mode) = {
             let status = self.aircraft_status.as_ref()?;
-            let gear_offset = if status.gear_is_down { 250 } else { 500 };
+            let gear_offset = if status.gear_is_down { 250.0 } else { 500.0 };
 
             // Calculate reference altitude with vertical speed prediction (like TypeScript)
-            let reference_altitude = if status.vertical_speed <= -1000 {
-                status.altitude + (status.vertical_speed as i32 / 2)
+            let reference_altitude = if status.vertical_speed <= -1000.0 {
+                status.altitude + (status.vertical_speed / 2.0)
             } else {
                 status.altitude
             };
 
             // Thresholds (from TypeScript)
-            const HIGH_DENSITY_GREEN_OFFSET: i32 = 1000;
-            const HIGH_DENSITY_RED_OFFSET: i32 = 2000;
+            const HIGH_DENSITY_GREEN_OFFSET: f64 = 1000.0;
+            const HIGH_DENSITY_RED_OFFSET: f64 = 2000.0;
 
             if is_normal_mode {
                 // Normal mode threshold calculations
@@ -1640,7 +1638,7 @@ impl TerrainProcessor {
                 };
 
                 // Mode for max elevation
-                let max_mode = if max_for_display >= high_density_red {
+                let max_mode = if max_for_display as f64 >= high_density_red {
                     TerrainLevelMode::Caution
                 } else {
                     TerrainLevelMode::Warning

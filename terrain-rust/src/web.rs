@@ -6,7 +6,7 @@
 
 use actix_web::{web, HttpResponse, Responder};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use log::error;
+use log::{error, info};
 use serde::Deserialize;
 
 use crate::AppState;
@@ -102,6 +102,7 @@ async fn aircraft_status_data(
     };
 
     let status = body.into_inner().into();
+
     processor.aircraft_status_update(status);
 
     HttpResponse::Ok().finish()
@@ -122,6 +123,7 @@ async fn vertical_display_path(
     };
 
     let path: VerticalPathData = body.into_inner().into();
+    info!("vertical_display_path: received {} waypoints, path_width={}", path.waypoints.len(), path.path_width);
     processor.vertical_path_update(path);
 
     HttpResponse::Ok().finish()

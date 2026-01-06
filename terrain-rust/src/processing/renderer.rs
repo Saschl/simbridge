@@ -814,6 +814,26 @@ impl VerticalDisplayRenderer {
         &self.display_config
     }
 
+    /// Get waypoint latitudes for elevation profile
+    pub fn waypoints_latitudes(&self) -> &[f64] {
+        &self.elevation_config.waypoints_latitudes
+    }
+
+    /// Get waypoint longitudes for elevation profile
+    pub fn waypoints_longitudes(&self) -> &[f64] {
+        &self.elevation_config.waypoints_longitudes
+    }
+
+    /// Get path width for elevation profile corridor
+    pub fn path_width(&self) -> f64 {
+        self.elevation_config.path_width
+    }
+
+    /// Get elevation profile range in nautical miles
+    pub fn elevation_range(&self) -> f64 {
+        self.elevation_config.range
+    }
+
     /// Start a new map rendering cycle for vertical display
     pub fn start_new_map_cycle(&mut self, current_time: Instant) {
         let map_width = self.display_config.map_width as usize;
