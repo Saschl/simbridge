@@ -123,7 +123,7 @@ async fn vertical_display_path(
     };
 
     let path: VerticalPathData = body.into_inner().into();
-    info!("vertical_display_path: received {} waypoints, path_width={}", path.waypoints.len(), path.path_width);
+    //info!("vertical_display_path: received {} waypoints, path_width={}", path.waypoints.len(), path.path_width);
     processor.vertical_path_update(path);
 
     HttpResponse::Ok().finish()

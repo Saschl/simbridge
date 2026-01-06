@@ -685,8 +685,8 @@ struct ElevationProfileConfig {
 #[derive(Clone)]
 pub struct VerticalDisplayConfig {
     pub range: f64,
-    pub minimum_altitude: i32,
-    pub maximum_altitude: i32,
+    pub minimum_altitude: f64,
+    pub maximum_altitude: f64,
     pub map_width: u32,
     pub map_height: u32,
 }
@@ -713,8 +713,8 @@ impl VerticalDisplayRenderer {
             },
             display_config: VerticalDisplayConfig {
                 range: 0.0,
-                minimum_altitude: -500,
-                maximum_altitude: 24000,
+                minimum_altitude: -500.,
+                maximum_altitude: 24000.,
                 map_width: RENDERING_ELEVATION_PROFILE_WIDTH as u32,
                 map_height: RENDERING_ELEVATION_PROFILE_HEIGHT as u32,
             },
@@ -753,8 +753,8 @@ impl VerticalDisplayRenderer {
 
         self.display_config = VerticalDisplayConfig {
             range: 0.0,
-            minimum_altitude: -500,
-            maximum_altitude: 24000,
+            minimum_altitude: -500.,
+            maximum_altitude: 24000.,
             map_width: RENDERING_ELEVATION_PROFILE_WIDTH as u32,
             map_height: RENDERING_ELEVATION_PROFILE_HEIGHT as u32,
         };

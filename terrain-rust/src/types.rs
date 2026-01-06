@@ -80,8 +80,8 @@ pub struct EfisData {
     pub terr_on_nd: bool,
     pub terr_on_vd: bool,
     pub efis_mode: u8,
-    pub vd_range_lower: i32,
-    pub vd_range_upper: i32,
+    pub vd_range_lower: f64,
+    pub vd_range_upper: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub map_offset_x: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,8 +174,8 @@ pub struct TawsEfisDataDto {
     pub terr_on_nd: bool,
     pub terr_on_vd: bool,
     pub efis_mode: u8,
-    pub vd_range_lower: i32,
-    pub vd_range_upper: i32,
+    pub vd_range_lower: f64,
+    pub vd_range_upper: f64,
 }
 
 /// TAWS aircraft status data DTO for web API

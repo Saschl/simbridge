@@ -120,6 +120,10 @@ struct RenderingThresholds {
     min_elevation: f64,
     /// Raw max elevation from terrain data
     max_elevation: f64,
+    /// Lower percentile elevation (85th percentile)
+    lower_percentile_elev: f64,
+    /// Upper percentile elevation (95th percentile)
+    upper_percentile_elev: f64,
 }
 
 impl TerrainProcessor {
@@ -598,6 +602,112 @@ impl TerrainProcessor {
         angle - (angle / 360.0).floor() * 360.0
     }
 
+    /// Calculate distance between two WGS84 coordinates in nautical miles
+    fn distance_wgs84(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+        const EARTH_RADIUS_NM: f64 = 3440.065; // Earth radius in nautical miles
+
+        let lat1_rad = lat1.to_radians();
+        let lat2_rad = lat2.to_radians();
+        let delta_lat = (lat2 - lat1).to_radians();
+        let delta_lon = (lon2 - lon1).to_radians();
+
+        let a = (delta_lat / 2.0).sin().powi(2)
+            + lat1_rad.cos() * lat2_rad.cos() * (delta_lon / 2.0).sin().powi(2);
+        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+
+        EARTH_RADIUS_NM * c
+    }
+
+    /// Extract elevation at a specific coordinate from cached data
+    fn extract_elevation(&self, latitude: f64, longitude: f64) -> Option<f32> {
+        let cached_data = self.cached_elevation_data.as_ref()?;
+        let metadata = &self.world_map_metadata;
+
+        if metadata.width == 0 || metadata.height == 0 {
+            return None;
+        }
+
+        // Check if coordinate is within bounds
+        if latitude < metadata.southwest.latitude || latitude > metadata.northeast.latitude ||
+           longitude < metadata.southwest.longitude || longitude > metadata.northeast.longitude {
+            return None;
+        }
+
+        let lat_step = (metadata.northeast.latitude - metadata.southwest.latitude) / metadata.height as f64;
+        let lon_step = (metadata.northeast.longitude - metadata.southwest.longitude) / metadata.width as f64;
+
+        let sample_x = ((longitude - metadata.southwest.longitude) / lon_step) as usize;
+        let sample_y = ((metadata.northeast.latitude - latitude) / lat_step) as usize;
+
+        if sample_x < metadata.width && sample_y < metadata.height {
+            let idx = sample_y * metadata.width + sample_x;
+            if idx < cached_data.data.len() {
+                return Some(cached_data.data[idx]);
+            }
+        }
+
+        None
+    }
+
+    /// Calculate the absolute cutoff altitude based on runway proximity and glide slope
+    /// This matches TypeScript's calculateAbsoluteCutOffAltitude()
+    fn calculate_absolute_cutoff_altitude(&self, status: &AircraftStatus) -> f64 {
+        // If no runway data is valid, return histogram minimum
+        if !status.runway_data_valid {
+            return HISTOGRAM_MINIMUM_ELEVATION as f64;
+        }
+
+        // Get destination (runway) elevation
+        let destination_elevation = match self.extract_elevation(status.runway_latitude, status.runway_longitude) {
+            Some(elev) if elev != INVALID_ELEVATION as f32 => elev as f64,
+            _ => return HISTOGRAM_MINIMUM_ELEVATION as f64,
+        };
+
+        // Calculate distance to runway in nautical miles
+        let distance = Self::distance_wgs84(
+            status.latitude,
+            status.longitude,
+            status.runway_latitude,
+            status.runway_longitude,
+        );
+
+        // Only apply cutoff logic within RENDERING_MAX_AIRPORT_DISTANCE (4 NM)
+        if distance > RENDERING_MAX_AIRPORT_DISTANCE {
+            return HISTOGRAM_MINIMUM_ELEVATION as f64;
+        }
+
+        let mut cutoff_altitude = RENDERING_CUT_OFF_ALTITUDE_MAXIMUM as f64;
+        let distance_feet = distance * FEET_PER_NAUTICAL_MILE;
+
+        // Calculate the glide until touchdown
+        let opposite = status.altitude - destination_elevation;
+        let mut glide_radian = 0.0;
+        if opposite > 0.0 && distance > 0.0 {
+            // Calculate the glide slope: opposite [ft] -> distance needs to be converted to feet
+            glide_radian = (opposite / distance_feet).atan();
+        }
+
+        // Check if the glide is less than 3° (0.0523599 radians)
+        if glide_radian < 0.0523599 {
+            if distance <= 1.0 || glide_radian == 0.0 {
+                // Use the minimum value close to the airport
+                cutoff_altitude = RENDERING_CUT_OFF_ALTITUDE_MINIMUM as f64;
+            } else {
+                // Use a linear model from max to min for 4 nm to 1 nm
+                let slope = (RENDERING_CUT_OFF_ALTITUDE_MINIMUM - RENDERING_CUT_OFF_ALTITUDE_MAXIMUM) as f64
+                    / THREE_NAUTICAL_MILES_IN_FEET;
+                cutoff_altitude = (slope * (distance_feet - FEET_PER_NAUTICAL_MILE)
+                    + RENDERING_CUT_OFF_ALTITUDE_MAXIMUM as f64).round();
+
+                // Ensure we are not below the minimum and not above the maximum
+                cutoff_altitude = cutoff_altitude.max(RENDERING_CUT_OFF_ALTITUDE_MINIMUM as f64);
+                cutoff_altitude = cutoff_altitude.min(RENDERING_CUT_OFF_ALTITUDE_MAXIMUM as f64);
+            }
+        }
+
+        cutoff_altitude
+    }
+
     /// Render terrain to frame buffer and return (min_for_display, max_for_display, is_normal_mode)
     /// min_for_display is the lowDensityGreen threshold (or cutoff if higher) - the lowest rendered
     /// max_for_display is the actual maximum terrain elevation
@@ -671,8 +781,7 @@ impl TerrainProcessor {
 
         let center_x = map_width as f64 / 2.0;
 
-        // Color statistics for debugging
-        let mut color_stats = std::collections::HashMap::new();
+        // Elevation samples for histogram
         let mut elevation_samples: Vec<i16> = Vec::new();
 
         // First pass: calculate min/max elevation in visible area for mode selection
@@ -741,18 +850,48 @@ impl TerrainProcessor {
         // Each bin is HISTOGRAM_BIN_RANGE (100) feet wide
         let bin_count = ((HISTOGRAM_MAXIMUM_ELEVATION - HISTOGRAM_MINIMUM_ELEVATION) / HISTOGRAM_BIN_RANGE) as usize;
         let mut histogram = vec![0u32; bin_count + 1];
-        let mut total_samples = 0u32;
-        let mut min_bin: i32 = -1;
-        let mut max_bin: i32 = -1;
 
         for &elev in &elevation_samples {
             let elev_i32 = elev as i32;
-            let bin = ((elev_i32 - HISTOGRAM_MINIMUM_ELEVATION) / HISTOGRAM_BIN_RANGE) as usize;
-            if bin < histogram.len() {
-                histogram[bin] += 1;
-                total_samples += 1;
-                if min_bin < 0 || (bin as i32) < min_bin { min_bin = bin as i32; }
-                if max_bin < 0 || (bin as i32) > max_bin { max_bin = bin as i32; }
+            // TypeScript uses Math.ceil for binning, so we need to round up
+            // ceil((elevation - minElevation) / binRange)
+            let adjusted = elev_i32 - HISTOGRAM_MINIMUM_ELEVATION;
+            let bin = ((adjusted + HISTOGRAM_BIN_RANGE - 1) / HISTOGRAM_BIN_RANGE) as usize; // Ceiling division
+            let bin = bin.min(histogram.len() - 1); // Clamp to valid range
+            histogram[bin] += 1;
+        }
+
+        // Calculate cutoff altitude based on runway proximity (like TypeScript calculateAbsoluteCutOffAltitude)
+        let cutoff_altitude = self.calculate_absolute_cutoff_altitude(status);
+        let cutoff_bin = ((cutoff_altitude - HISTOGRAM_MINIMUM_ELEVATION as f64) / HISTOGRAM_BIN_RANGE as f64).ceil().max(0.0) as usize;
+
+        // Calculate total frequency starting from cutoff bin (like TypeScript)
+        let mut total_samples = 0u32;
+        for bin in cutoff_bin..histogram.len() {
+            total_samples += histogram[bin];
+        }
+
+        // Find min/max bins and percentiles starting from cutoff bin (like TypeScript)
+        let mut min_bin: i32 = -1;
+        let mut max_bin: i32 = -1;
+        let mut lower_percentile_bin: i32 = -1;
+        let mut upper_percentile_bin: i32 = -1;
+        let mut cumulative_percent = 0.0f64;
+
+        for bin in cutoff_bin..histogram.len() {
+            if total_samples > 0 {
+                cumulative_percent += histogram[bin] as f64 / total_samples as f64;
+                if lower_percentile_bin < 0 && cumulative_percent >= RENDERING_LOWER_PERCENTILE {
+                    lower_percentile_bin = bin as i32;
+                }
+                if upper_percentile_bin < 0 && cumulative_percent >= RENDERING_UPPER_PERCENTILE {
+                    upper_percentile_bin = bin as i32;
+                }
+            }
+
+            if histogram[bin] > 0 {
+                if min_bin < 0 { min_bin = bin as i32; }
+                max_bin = bin as i32;
             }
         }
 
@@ -769,27 +908,6 @@ impl TerrainProcessor {
         } else {
             max_elevation
         };
-
-        // Calculate percentile elevations from histogram (like TypeScript GPU)
-        // lowerPercentile = 0.85, upperPercentile = 0.95
-        let mut lower_percentile_bin: i32 = -1;
-        let mut upper_percentile_bin: i32 = -1;
-        let mut cumulative_percent = 0.0f64;
-
-        let cutoff_altitude = HISTOGRAM_MINIMUM_ELEVATION as f64; // -500
-        let cutoff_bin = 0i32; // First bin (for elevations >= -500)
-
-        for bin in cutoff_bin as usize..histogram.len() {
-            if total_samples > 0 {
-                cumulative_percent += histogram[bin] as f64 / total_samples as f64;
-                if lower_percentile_bin < 0 && cumulative_percent >= RENDERING_LOWER_PERCENTILE {
-                    lower_percentile_bin = bin as i32;
-                }
-                if upper_percentile_bin < 0 && cumulative_percent >= RENDERING_UPPER_PERCENTILE {
-                    upper_percentile_bin = bin as i32;
-                }
-            }
-        }
 
         // Convert percentile bins to elevations
         let lower_percentile_elev = if lower_percentile_bin >= 0 {
@@ -872,15 +990,17 @@ impl TerrainProcessor {
             use_normal_mode,
             min_elevation,
             max_elevation,
+            lower_percentile_elev: lower_percentile_elev as f64,
+            upper_percentile_elev: upper_percentile_elev as f64,
         };
-/*
+
         debug!("Thresholds: low_green={}, high_green={}, low_yellow={}, high_yellow={}, high_red={}",
             thresholds.low_density_green, thresholds.high_density_green, thresholds.low_density_yellow,
             thresholds.high_density_yellow, thresholds.high_density_red);
         debug!("Elevation range: {} to {} ft, aircraft: {} ft (ref: {}), cutoff: {} ft, using {} mode",
             thresholds.min_elevation, thresholds.max_elevation, status.altitude, thresholds.reference_altitude,
             thresholds.cutoff_altitude, if thresholds.use_normal_mode { "NORMAL" } else { "PEAKS" });
- */
+
         // Second pass: Render each pixel
         for y in 0..map_height {
             for x in 0..map_width {
@@ -977,9 +1097,6 @@ impl TerrainProcessor {
 
                         // Apply pattern - only draw if pattern check passes
                         if self.should_draw_pattern(x, y, pattern_idx) {
-                            // Track color stats
-                            let color_key = format!("{},{},{}", r, g, b);
-                            *color_stats.entry(color_key).or_insert(0) += 1;
 
                             // Set pixel in frame
                             let frame_idx = (pixel_y * frame_width + pixel_x) * RENDERING_COLOR_CHANNEL_COUNT;
@@ -996,10 +1113,7 @@ impl TerrainProcessor {
             }
         }
 
-        // Log color distribution
-      /*   debug!("Color distribution: {:?}", color_stats);
-        debug!("Sample elevations (first 100): {:?}", elevation_samples);
-        debug!("Aircraft altitude: {} ft, gear down: {}", status.altitude, status.gear_is_down); */
+
 
         // Draw aircraft position marker (white cross) at center-bottom
         let aircraft_pixel_x = offset_x + (map_width / 2);
@@ -1131,6 +1245,8 @@ impl TerrainProcessor {
 
                 // Calculate pixel position in the buffer
                 let buf_idx = (y * vd_width + x) * RENDERING_COLOR_CHANNEL_COUNT;
+
+
 
                 // Determine color based on elevation vs altitude
                 let (r, g, b, a) = if elevation == INVALID_ELEVATION as f32 || elevation == UNKNOWN_ELEVATION as f32 {
@@ -1356,10 +1472,11 @@ impl TerrainProcessor {
             return (0, 0, 0, 254); // 254 = black background marker
         }
 
-        let elevation_ft = elevation as i32;
+        // Use f64 for all comparisons to avoid rounding issues (like TypeScript)
+        let elevation_ft = elevation as f64;
 
         // TypeScript: check elevation >= absoluteCutOffAltitude before rendering colors
-        if elevation_ft < thresholds.cutoff_altitude as i32 {
+        if elevation_ft < thresholds.cutoff_altitude {
             return (0, 0, 0, 254);
         }
 
@@ -1372,19 +1489,19 @@ impl TerrainProcessor {
             // 4. elevation >= warningThresholds[0] (low_density_yellow) AND elevation < warningThresholds[1] (high_density_yellow) -> yellow low density
             // 5. elevation >= greenThresholds[0] (low_density_green) AND elevation < greenThresholds[1] (high_density_green) -> green low density
 
-            if elevation_ft >= thresholds.high_density_red  as i32 {
+            if elevation_ft >= thresholds.high_density_red {
                 // High density red - immediate danger (pattern index 5)
                 (255, 0, 0, 5)
-            } else if elevation_ft >= thresholds.high_density_yellow as i32{
+            } else if elevation_ft >= thresholds.high_density_yellow {
                 // High density yellow - caution (pattern index 5)
                 (255, 255, 50, 5)
-            } else if elevation_ft >= thresholds.high_density_green as i32 && elevation_ft < thresholds.low_density_yellow as i32{
-                // High density green - terrain close but below (pattern index 5)
+            } else if elevation_ft >= thresholds.high_density_green && elevation_ft < thresholds.low_density_yellow {
+                // High density green - terrain close but below warning (pattern index 5)
                 (0, 255, 0, 5)
-            } else if elevation_ft >= thresholds.low_density_yellow as i32 && elevation_ft < thresholds.high_density_yellow as i32{
-                // Low density yellow - approaching caution level (pattern index 3)
+            } else if elevation_ft >= thresholds.low_density_yellow && elevation_ft < thresholds.high_density_yellow {
+                // Low density yellow - warning level terrain (pattern index 3)
                 (255, 255, 50, 3)
-            } else if elevation_ft >= thresholds.low_density_green as i32 && elevation_ft < thresholds.high_density_green as i32{
+            } else if elevation_ft >= thresholds.low_density_green && elevation_ft < thresholds.high_density_green {
                 // Low density green - safe terrain (pattern index 3)
                 (0, 255, 0, 3)
             } else {
@@ -1393,23 +1510,36 @@ impl TerrainProcessor {
             }
         } else {
             // PEAKS MODE - terrain is well below aircraft, show terrain relief
-            // Calculate thresholds based on terrain distribution
+            // Calculate thresholds based on terrain distribution (from calculatePeaksModeThresholds)
             let elevation_range = thresholds.max_elevation - thresholds.min_elevation;
-            let half_elevation = (thresholds.max_elevation + thresholds.min_elevation) / 2.;
+            let half_elevation = (thresholds.max_elevation + thresholds.min_elevation) / 2.0;
 
-            // Calculate density thresholds (from calculatePeaksModeThresholds)
-            let lower_density = half_elevation;
-            let higher_density = thresholds.min_elevation  + (elevation_range as f64 * 0.65);
-            let solid_density = thresholds.min_elevation + (elevation_range as f64 * 0.95) ;
+            // TypeScript: const lowerDensity = Math.min(lowerPercentile, halfElevation);
+            let lower_density = thresholds.lower_percentile_elev.min(half_elevation);
+            // TypeScript: let higherDensity = Math.min(upperPercentile, (maximumElevation - minimumElevation) * 0.65 + minimumElevation);
+            let mut higher_density = thresholds.upper_percentile_elev.min(thresholds.min_elevation + elevation_range * 0.65);
+            // TypeScript: let solidDensity = (maximumElevation - minimumElevation) * 0.95 + minimumElevation;
+            let mut solid_density = thresholds.min_elevation + elevation_range * 0.95;
+
+            // TypeScript validation: if thresholds overlap incorrectly, disable higher densities
+            if lower_density >= higher_density ||
+               lower_density >= solid_density ||
+               higher_density >= solid_density ||
+               thresholds.lower_percentile_elev >= thresholds.upper_percentile_elev ||
+               thresholds.lower_percentile_elev >= solid_density ||
+               thresholds.upper_percentile_elev >= solid_density {
+                higher_density = thresholds.max_elevation + 100.0;
+                solid_density = thresholds.max_elevation + 100.0;
+            }
 
             // Determine color based on elevation relative to terrain distribution
-            if elevation_ft >= solid_density as i32{
+            if elevation_ft >= solid_density {
                 // Solid green - highest peaks (solid, no pattern)
                 (0, 255, 0, 255)
-            } else if elevation_ft >= higher_density as i32  {
+            } else if elevation_ft >= higher_density {
                 // High density green (pattern index 5)
                 (0, 255, 0, 5)
-            } else if elevation_ft >= lower_density as i32 {
+            } else if elevation_ft >= lower_density {
                 // Low density green (pattern index 3)
                 (0, 255, 0, 3)
             } else {
