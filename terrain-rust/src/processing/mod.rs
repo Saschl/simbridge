@@ -248,7 +248,6 @@ impl TerrainProcessor {
         }
 
 
-    info!("aircraft status update {}", status.efis_data_capt.vd_range_upper);
         // Update rendering mode
         self.vertical_display_required =
             (status.navigation_display_rendering_mode & TerrainRenderingMode::VerticalDisplayRequired as u8) != 0;
@@ -744,6 +743,9 @@ impl TerrainProcessor {
         let nd_range = config.nd_range as f64; // in nautical miles
         let arc_mode = config.arc_mode;
 
+        info!("render_terrain_to_frame: offset_y={}, map_width={}, map_height={}, offset_x={}, center_offset_y={}, arc_mode={}, rendering_mode={:?}",
+            offset_y, map_width, map_height, offset_x, center_offset_y, arc_mode, self.rendering_mode);
+
         // Calculate meters per pixel based on ND range
         // Range is displayed from center to top of display
         // TypeScript uses Math.round() for this value
@@ -792,11 +794,6 @@ impl TerrainProcessor {
             for x in 0..map_width {
                 let delta_x = x as f64 - center_x;
                 let delta_y = (map_height as f64) - (y as f64) - center_offset_y;
-
-                // Skip pixels behind the aircraft (negative delta_y means behind)
-                if delta_y < 0.0 {
-                    continue;
-                }
 
                 let distance_pixels = (delta_x * delta_x + delta_y * delta_y).sqrt();
 
@@ -863,7 +860,8 @@ impl TerrainProcessor {
 
         // Calculate cutoff altitude based on runway proximity (like TypeScript calculateAbsoluteCutOffAltitude)
         let cutoff_altitude = self.calculate_absolute_cutoff_altitude(status);
-        let cutoff_bin = ((cutoff_altitude - HISTOGRAM_MINIMUM_ELEVATION as f64) / HISTOGRAM_BIN_RANGE as f64).ceil().max(0.0) as usize;
+        // TypeScript uses Math.floor for cutoff bin (not ceil like histogram binning)
+        let cutoff_bin = ((cutoff_altitude - HISTOGRAM_MINIMUM_ELEVATION as f64) / HISTOGRAM_BIN_RANGE as f64).floor().max(0.0) as usize;
 
         // Calculate total frequency starting from cutoff bin (like TypeScript)
         let mut total_samples = 0u32;
@@ -1011,11 +1009,6 @@ impl TerrainProcessor {
                 let delta_x = x as f64 - center_x;
                 let delta_y = (map_height as f64) - (y as f64) - center_offset_y;
 
-                // Skip pixels behind the aircraft (negative delta_y means behind)
-                if delta_y < 0.0 {
-                    continue;
-                }
-
                 let distance_pixels = (delta_x * delta_x + delta_y * delta_y).sqrt();
 
                 // Arc clipping for A32NX (centerOffsetY == 0)
@@ -1161,11 +1154,11 @@ impl TerrainProcessor {
 
         // Bin to histogram boundaries like TypeScript
         // min: floor to bin boundary
-        let min_bin = (min_raw - HISTOGRAM_MINIMUM_ELEVATION as f64) / HISTOGRAM_BIN_RANGE as f64;
+        let min_bin = ((min_raw - HISTOGRAM_MINIMUM_ELEVATION as f64) / HISTOGRAM_BIN_RANGE as f64).floor();
         let min_for_display = min_bin * HISTOGRAM_BIN_RANGE as f64 + HISTOGRAM_MINIMUM_ELEVATION as f64;
 
         // max: ceil to next bin boundary (bin + 1)
-        let max_bin = (thresholds.max_elevation - HISTOGRAM_MINIMUM_ELEVATION as f64) / HISTOGRAM_BIN_RANGE as f64;
+        let max_bin = ((thresholds.max_elevation - HISTOGRAM_MINIMUM_ELEVATION as f64) / HISTOGRAM_BIN_RANGE as f64).floor();
         let max_for_display = (max_bin + 1.) * HISTOGRAM_BIN_RANGE as f64 + HISTOGRAM_MINIMUM_ELEVATION as f64;
 
         (min_for_display, max_for_display, thresholds.use_normal_mode)
@@ -1636,7 +1629,8 @@ impl TerrainProcessor {
         let (frame, min_for_display, max_for_display, is_normal_mode, width, height) =
             self.render_raw_frame_with_stats(side)?;
 
-        // Calculate elevation modes
+        // Calculate elevation modes using adjusted thresholds (like TypeScript analyzeMetadata)
+        // min_for_display is already the adjusted lowDensityGreen threshold
         let (min_mode, max_mode) = {
             let status = self.aircraft_status.as_ref()?;
             let gear_offset = if status.gear_is_down { 250.0 } else { 500.0 };
@@ -1651,17 +1645,32 @@ impl TerrainProcessor {
             const HIGH_DENSITY_RED_OFFSET: f64 = 2000.0;
 
             if is_normal_mode {
-                let high_density_green = reference_altitude - HIGH_DENSITY_GREEN_OFFSET;
-                let low_density_yellow = reference_altitude - gear_offset;
+                // Calculate adjusted thresholds like render_terrain_to_frame does
+                // Use min_for_display as the effective minimum elevation (it's the lowDensityGreen)
+                let min_elevation = min_for_display;
+
+                let high_density_green = if reference_altitude - HIGH_DENSITY_GREEN_OFFSET <= min_elevation {
+                    min_elevation + 200.0
+                } else {
+                    reference_altitude - HIGH_DENSITY_GREEN_OFFSET
+                };
+
+                let low_density_yellow = if reference_altitude - gear_offset <= min_elevation {
+                    min_elevation + 200.0
+                } else {
+                    reference_altitude - gear_offset
+                };
+
                 let high_density_red = reference_altitude + HIGH_DENSITY_RED_OFFSET;
 
+                // TypeScript: if (lowDensityYellow <= highDensityGreen) -> Warning (yellow)
                 let min_mode = if low_density_yellow <= high_density_green {
                     TerrainLevelMode::Warning
                 } else {
                     TerrainLevelMode::PeaksMode
                 };
 
-                let max_mode = if max_for_display as f64 >= high_density_red {
+                let max_mode = if max_for_display >= high_density_red {
                     TerrainLevelMode::Caution
                 } else {
                     TerrainLevelMode::Warning
@@ -1705,114 +1714,6 @@ impl TerrainProcessor {
         Some((metadata, frame, width, height))
     }
 
-    /// Render a navigation display frame and return both metadata and frame data
-    /// This is used by the SimConnect handler to send data back to the simulator
-    pub fn render_frame_for_simconnect(&mut self, side: DisplaySide) -> Option<(crate::types::NavigationDisplayData, Vec<u8>)> {
-        if !self.initialized {
-            debug!("render_frame_for_simconnect: not initialized");
-            return None;
-        }
-
-        // Check if terrain display is enabled
-        {
-            let state = match self.display_rendering.get(&side) {
-                Some(s) => s,
-                None => {
-                    warn!("No display rendering state for {:?}", side);
-                    return None;
-                }
-            };
-            let nd_config = state.navigation_display.display_configuration();
-
-            debug!("render_frame_for_simconnect({:?}): terr_on_nd={}, terr_on_vd={}",
-                side, nd_config.terr_on_nd, nd_config.terr_on_vd);
-
-            if !nd_config.terr_on_nd && !nd_config.terr_on_vd {
-                debug!("Terrain display not enabled for {:?}", side);
-                return None;
-            }
-        }
-
-        // Render the frame - returns (frame, min_for_display, max_for_display, is_normal_mode)
-        // min_for_display is the lowDensityGreen threshold (what TypeScript displays as MinimumElevation)
-        // max_for_display is the actual maximum terrain elevation
-        let (frame, min_for_display, max_for_display, is_normal_mode) = self.render_navigation_display_frame_with_stats(side)?;
-
-        // Calculate elevation modes based on thresholds and aircraft altitude
-        let (min_mode, max_mode) = {
-            let status = self.aircraft_status.as_ref()?;
-            let gear_offset = if status.gear_is_down { 250.0 } else { 500.0 };
-
-            // Calculate reference altitude with vertical speed prediction (like TypeScript)
-            let reference_altitude = if status.vertical_speed <= -1000.0 {
-                status.altitude + (status.vertical_speed / 2.0)
-            } else {
-                status.altitude
-            };
-
-            // Thresholds (from TypeScript)
-            const HIGH_DENSITY_GREEN_OFFSET: f64 = 1000.0;
-            const HIGH_DENSITY_RED_OFFSET: f64 = 2000.0;
-
-            if is_normal_mode {
-                // Normal mode threshold calculations
-                let high_density_green = reference_altitude - HIGH_DENSITY_GREEN_OFFSET;
-                let low_density_yellow = reference_altitude - gear_offset;
-                let high_density_red = reference_altitude + HIGH_DENSITY_RED_OFFSET;
-
-                // Mode for min elevation (from TypeScript analyzeMetadata)
-                let min_mode = if low_density_yellow <= high_density_green {
-                    TerrainLevelMode::Warning
-                } else {
-                    TerrainLevelMode::PeaksMode
-                };
-
-                // Mode for max elevation
-                let max_mode = if max_for_display as f64 >= high_density_red {
-                    TerrainLevelMode::Caution
-                } else {
-                    TerrainLevelMode::Warning
-                };
-
-                (min_mode, max_mode)
-            } else {
-                // Peaks mode - both are PeaksMode
-                (TerrainLevelMode::PeaksMode, TerrainLevelMode::PeaksMode)
-            }
-        };
-
-        // Build metadata with actual elevation values
-        let nd_range = self.display_rendering.get(&side)
-            .map(|s| s.navigation_display.display_configuration().nd_range as f64)
-            .unwrap_or(10.0);
-
-        let first_frame = self.display_rendering.get(&side)
-            .map(|s| s.navigation_display.first_frame())
-            .unwrap_or(true);
-
-        // Get efisMode from the display configuration - this must match what the aircraft sends
-        let efis_mode = self.display_rendering.get(&side)
-            .map(|s| s.navigation_display.display_configuration().efis_mode)
-            .unwrap_or(0);
-
-        let metadata = crate::types::NavigationDisplayData {
-            minimum_elevation: min_for_display as i16,
-            minimum_elevation_mode: min_mode,
-            maximum_elevation: max_for_display as i16,
-            maximum_elevation_mode: max_mode,
-            first_frame,
-            display_range: nd_range,
-            display_mode: efis_mode,  // Must match aircraft's efisMode, not just arc/rose
-            frame_byte_count: frame.len() as u32,
-        };
-
-        // Mark first frame as false for subsequent frames
-        if let Some(state) = self.display_rendering.get_mut(&side) {
-            state.navigation_display.set_first_frame(false);
-        }
-
-        Some((metadata, frame))
-    }
 
     /// Get the current rendering mode
     pub fn get_rendering_mode(&self) -> TerrainRenderingMode {

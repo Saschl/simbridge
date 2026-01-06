@@ -597,16 +597,17 @@ impl NavigationDisplayRenderer {
 
     /// Create a transition frame for scanline mode
     ///
-    /// Blends old and new frames based on vertical position.
+    /// Blends old and new frames based on vertical position within the map area.
+    /// Pixels outside the map area are copied from the new frame.
     /// Pixels in the transition zone (between start_border and current_border) show new frame.
     fn scanline_mode_transition_frame(
         &self,
         old_frame: Option<&Vec<u8>>,
         new_frame: &[u8],
-        map_width: usize,
-        map_height: usize,
+        frame_width: usize,
+        frame_height: usize,
     ) -> Vec<u8> {
-        let frame_size = map_width * RENDERING_COLOR_CHANNEL_COUNT * map_height;
+        let frame_size = frame_width * RENDERING_COLOR_CHANNEL_COUNT * frame_height;
         let mut result = vec![0u8; frame_size];
 
         // Access data as u32 arrays for performance
@@ -625,25 +626,40 @@ impl NavigationDisplayRenderer {
         let start_border = self.rendering_data.start_transition_border as usize;
         let current_border = self.rendering_data.current_transition_border.max(0) as usize;
 
-        let mut array_index = 0;
-        for y in 0..map_height {
-            for x in 0..map_width {
-                // Note: TypeScript uses <= and >= for scanline (sweeping down from top)
-                // y <= startBorder means above the start
-                // y >= currentBorder means above the current line
-                if y <= start_border && y >= current_border {
-                    // Within transition zone - show new frame
+        // Get map area parameters
+        let map_offset_y = NAVIGATION_DISPLAY_MAP_START_OFFSET_Y;
+        let map_height = self.configuration.map_height.unwrap_or(NAVIGATION_DISPLAY_MAX_PIXEL_HEIGHT as u32) as usize;
+        let map_end_y = map_offset_y + map_height;
+
+        for y in 0..frame_height {
+            for x in 0..frame_width {
+                let array_index = y * frame_width + x;
+
+                if y < map_offset_y || y >= map_end_y {
+                    // Outside map area - copy from new frame (or old if new not available)
                     if array_index < new_source_u32.len() {
                         result_u32[array_index] = new_source_u32[array_index];
                     }
-                } else if let Some(old_src) = old_source_u32 {
-                    // Outside transition zone - show old frame
-                    if array_index < old_src.len() {
-                        result_u32[array_index] = old_src[array_index];
+                } else {
+                    // Inside map area - apply transition logic
+                    // Convert frame y to map-relative y for border comparison
+                    let map_y = y - map_offset_y;
+
+                    // Note: TypeScript uses <= and >= for scanline (sweeping down from top)
+                    // map_y <= startBorder means above the start
+                    // map_y >= currentBorder means above the current line
+                    if map_y <= start_border && map_y >= current_border {
+                        // Within transition zone - show new frame
+                        if array_index < new_source_u32.len() {
+                            result_u32[array_index] = new_source_u32[array_index];
+                        }
+                    } else if let Some(old_src) = old_source_u32 {
+                        // Outside transition zone - show old frame
+                        if array_index < old_src.len() {
+                            result_u32[array_index] = old_src[array_index];
+                        }
                     }
                 }
-
-                array_index += 1;
             }
         }
 
