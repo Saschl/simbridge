@@ -791,8 +791,8 @@ impl TerrainProcessor {
         let nd_range = config.nd_range as f64; // in nautical miles
         let arc_mode = config.arc_mode;
 
-        info!("render_terrain_to_frame: offset_y={}, map_width={}, map_height={}, offset_x={}, center_offset_y={}, arc_mode={}, rendering_mode={:?}",
-            offset_y, map_width, map_height, offset_x, center_offset_y, arc_mode, self.rendering_mode);
+      /*   info!("render_terrain_to_frame: offset_y={}, map_width={}, map_height={}, offset_x={}, center_offset_y={}, arc_mode={}, rendering_mode={:?}",
+            offset_y, map_width, map_height, offset_x, center_offset_y, arc_mode, self.rendering_mode); */
 
         // Calculate meters per pixel based on ND range
         // Range is displayed from center to top of display
@@ -1344,7 +1344,7 @@ impl TerrainProcessor {
             }
         }
 
-        debug!("Vertical display raw rendering complete for {:?}, fms_path={}, waypoints={}, grey_area_x={}", 
+        debug!("Vertical display raw rendering complete for {:?}, fms_path={}, waypoints={}, grey_area_x={}",
                side, fms_path_used, waypoints_lat.len(), grey_area_starts_at_x);
         Some(buffer)
     }
@@ -1494,7 +1494,7 @@ impl TerrainProcessor {
 
         // Calculate distance per pixel in nautical miles
         let distance_per_pixel_nm = range_nm / profile_width as f64;
-        
+
         // Path offset in metres (half-width of corridor)
         let offset_meters = (path_width_nm * NAUTICAL_MILES_TO_METRES) / 2.0;
 
@@ -1504,7 +1504,7 @@ impl TerrainProcessor {
 
         for x in 0..profile_width {
             let distance_for_pixel_nm = distance_per_pixel_nm * x as f64;
-            
+
             // Find the correct waypoint segment for this distance
             let mut route_segment_index = waypoint_count;
             let mut route_start_point_distance_nm = 0.0;
@@ -1516,7 +1516,7 @@ impl TerrainProcessor {
                     start_latitude, start_longitude,
                     waypoints_lat[i], waypoints_lon[i]
                 );
-                
+
                 if route_start_point_distance_nm + current_distance_nm >= distance_for_pixel_nm {
                     route_segment_index = i;
                     break;
@@ -1539,7 +1539,7 @@ impl TerrainProcessor {
                 start_latitude, start_longitude,
                 waypoints_lat[route_segment_index], waypoints_lon[route_segment_index]
             );
-            
+
             let (center_lat, center_lon) = Self::project_wgs84(
                 start_latitude, start_longitude, bearing, remaining_distance_m
             );
@@ -1662,9 +1662,9 @@ impl TerrainProcessor {
                 if idx < cached_data.data.len() {
                     let elevation = cached_data.data[idx];
                     // Skip invalid and unknown for max calculation
-                    if elevation != INVALID_ELEVATION as f32 
-                        && elevation != UNKNOWN_ELEVATION as f32 
-                        && elevation > max_elevation 
+                    if elevation != INVALID_ELEVATION as f32
+                        && elevation != UNKNOWN_ELEVATION as f32
+                        && elevation > max_elevation
                     {
                         max_elevation = elevation;
                     }
@@ -1700,7 +1700,7 @@ impl TerrainProcessor {
 
         let a = 0.5 - delta_lat.cos() * 0.5
             + lat1_rad.cos() * lat2_rad.cos() * (1.0 - delta_lon.cos()) * 0.5;
-        
+
         let distance_metres = 12742020.0 * a.sqrt().asin();
         distance_metres / NAUTICAL_MILES_TO_METRES
     }
@@ -1715,7 +1715,7 @@ impl TerrainProcessor {
         let y = (end_lon - start_lon).sin() * end_lat.cos();
         let x = start_lat.cos() * end_lat.sin()
             - start_lat.sin() * end_lat.cos() * (end_lon - start_lon).cos();
-        
+
         let bearing = y.atan2(x).to_degrees();
         (bearing + 360.0) % 360.0
     }
