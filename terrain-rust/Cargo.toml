@@ -1,0 +1,29 @@
+[package]
+name = "fbw-simbridge-terrain"
+version = "0.1.0"
+edition = "2021"
+description = "CPU-only Rust rewrite of the SimBridge terrain module (Terrain on ND/VD)"
+license = "GPL-3.0"
+publish = false
+
+[[bin]]
+name = "terrain-service"
+path = "src/main.rs"
+
+[features]
+# SimConnect requires the MSFS SDK (and libclang) at build time; disable for
+# pure rendering/test builds: cargo build --no-default-features
+default = ["simconnect"]
+simconnect = ["dep:msfs"]
+
+[dependencies]
+base64 = "0.22"
+flate2 = "1"
+msfs = { git = "https://github.com/flybywiresim/msfs-rs", optional = true }
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+
+[profile.release]
+lto = true
