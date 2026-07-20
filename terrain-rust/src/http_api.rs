@@ -163,7 +163,6 @@ impl HttpApi {
                 },
                 (Method::Post, "/api/v1/terrain/aircraftStatusData") => {
                     let mut body = String::new();
-                    eprintln!("[INFO] SOME STUFF IS HAPPENING");
                     let _ = request.as_reader().read_to_string(&mut body);
                     match serde_json::from_str::<AircraftStatus>(&body) {
                         Ok(status) => {

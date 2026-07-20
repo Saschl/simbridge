@@ -174,7 +174,7 @@ export class TerrainService implements OnApplicationShutdown {
   }
 
   public updateAircraftStatusData(aircraftStatusData: TawsAircraftStatusDataDto): void {
-    console.log('Updating aircraft status data:', aircraftStatusData);
+    //console.log('Updating aircraft status data:', aircraftStatusData);
     this.proxyPost('/api/v1/terrain/aircraftStatusData', aircraftStatusData);
   }
 
