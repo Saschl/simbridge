@@ -48,6 +48,23 @@ fn blend<F: Fn(usize, usize) -> bool>(
     result
 }
 
+/// Per-pixel sweep angles (degrees off the vertical centerline) for the arc
+/// transition. Computed once per display dimension and cached — the values
+/// only depend on (x, y, width, height), not on the frame content (upstream
+/// PR #157). Stored as f32 like the upstream `Float32Array`.
+pub fn arc_angle_mask(width: usize, height: usize) -> Vec<f32> {
+    let mut mask = Vec::with_capacity(width * height);
+    for y in 0..height {
+        let dy = height as f64 - y as f64;
+        for x in 0..width {
+            let dx = x as f64 - width as f64 / 2.0;
+            let distance = (dx * dx + dy * dy).sqrt();
+            mask.push(((dy / distance).acos() * (180.0 / std::f64::consts::PI)) as f32);
+        }
+    }
+    mask
+}
+
 /// Pixels within the angular band [start, end] (degrees off the vertical
 /// centerline) show the new frame (`arcModeTransitionFrame`).
 pub fn arc_mode_frame(
@@ -57,12 +74,10 @@ pub fn arc_mode_frame(
     end_angle: i64,
     width: usize,
     height: usize,
+    angle_mask: &[f32],
 ) -> Vec<u8> {
     blend(old_frame, new_frame, width, height, ND_BACKGROUND, |x, y| {
-        let dx = x as f64 - width as f64 / 2.0;
-        let dy = height as f64 - y as f64;
-        let distance = (dx * dx + dy * dy).sqrt();
-        let angle = (dy / distance).acos() * (180.0 / std::f64::consts::PI);
+        let angle = angle_mask[y * width + x] as f64;
         start_angle as f64 <= angle && angle <= end_angle as f64
     })
 }
@@ -107,6 +122,35 @@ pub enum TransitionStyle {
     VerticalDisplay,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cached f32 angle mask must reproduce the original per-tick
+    /// computation (modulo f32 storage, which the upstream Float32Array cache
+    /// shares).
+    #[test]
+    fn arc_mask_blend_matches_direct_computation() {
+        let (width, height) = (40, 30);
+        let old: Vec<u8> = (0..width * height * 4).map(|i| (i % 251) as u8).collect();
+        let new: Vec<u8> = (0..width * height * 4).map(|i| (i % 241) as u8).collect();
+        let (start, end) = (10i64, 50i64);
+
+        let mask = arc_angle_mask(width, height);
+        let masked = arc_mode_frame(Some(&old), &new, start, end, width, height, &mask);
+
+        let direct = blend(Some(&old), &new, width, height, ND_BACKGROUND, |x, y| {
+            let dx = x as f64 - width as f64 / 2.0;
+            let dy = height as f64 - y as f64;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let angle = (dy / distance).acos() * (180.0 / std::f64::consts::PI);
+            start as f64 <= angle && angle <= end as f64
+        });
+
+        assert_eq!(masked, direct);
+    }
+}
+
 /// Per-display transition state (the `renderingData` block of the TS
 /// renderers, minus the threshold bookkeeping which lives in the orchestrator).
 pub struct Transition {
@@ -118,6 +162,9 @@ pub struct Transition {
     pub current_frame: Option<Vec<u8>>,
     pub width: usize,
     pub height: usize,
+    /// Cached arc sweep angles for the current dimensions; survives resets
+    /// (only depends on width/height).
+    arc_angle_mask: Vec<f32>,
 }
 
 impl Transition {
@@ -131,6 +178,7 @@ impl Transition {
             current_frame: None,
             width: 0,
             height: 0,
+            arc_angle_mask: Vec::new(),
         }
     }
 
@@ -161,6 +209,11 @@ impl Transition {
         now_ms: u64,
         startup_ms: u64,
     ) {
+        if self.style == TransitionStyle::Arc
+            && (self.width != width || self.height != height || self.arc_angle_mask.is_empty())
+        {
+            self.arc_angle_mask = arc_angle_mask(width, height);
+        }
         self.width = width;
         self.height = height;
         self.final_frame = Some(final_frame);
@@ -201,6 +254,7 @@ impl Transition {
                         self.current_border,
                         self.width,
                         self.height,
+                        &self.arc_angle_mask,
                     ));
                     return false;
                 }
@@ -212,6 +266,7 @@ impl Transition {
                         90,
                         self.width,
                         self.height,
+                        &self.arc_angle_mask,
                     ));
                 }
             }
