@@ -2,9 +2,6 @@
 
 use std::io::Cursor;
 
-/// Encodes an RGBA8 buffer as PNG. Fast compression + Sub filtering keeps the
-/// encode well under the 40 ms frame budget while staying small enough for the
-/// 8 kB SimConnect chunking.
 pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, png::EncodingError> {
     debug_assert_eq!(rgba.len(), width * height * 4);
 
@@ -14,7 +11,7 @@ pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, 
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fast);
-        encoder.set_filter(png::FilterType::Sub);
+        encoder.set_filter(png::Filter::Sub);
         let mut writer = encoder.write_header()?;
         writer.write_image_data(rgba)?;
     }

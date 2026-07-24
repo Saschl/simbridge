@@ -17,10 +17,10 @@ default = ["simconnect"]
 simconnect = ["dep:msfs"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23.0"
 flate2 = "1"
 msfs = { git = "https://github.com/flybywiresim/msfs-rs", optional = true }
-png = "0.17"
+png = "0.18.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"

@@ -5,6 +5,8 @@
 //!   render_scene --scenario <file.json> [--db <terrain.map>] [--out <out.png>] [--side L|R]
 //!   render_scene --scenario <file.json> --compare <golden.png>
 
+use std::fs::File;
+use std::io::BufReader;
 use std::process::exit;
 
 use fbw_simbridge_terrain::compositor::{
@@ -178,10 +180,10 @@ fn main() {
     }
 
     if let Some(compare_path) = &compare_path {
-        let mut golden = png::Decoder::new(std::fs::File::open(compare_path).expect("open golden"));
+        let mut golden = png::Decoder::new(BufReader::new(File::open(compare_path).expect("open golden")));
         golden.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = golden.read_info().expect("golden header");
-        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut buf).expect("golden frame");
         buf.truncate(info.buffer_size());
 
@@ -304,10 +306,10 @@ fn main() {
             eprintln!("--compare-vd given but the scenario renders no VD");
             exit(1);
         };
-        let mut golden = png::Decoder::new(std::fs::File::open(vd_golden_path).expect("open vd golden"));
+        let mut golden = png::Decoder::new(BufReader::new(File::open(vd_golden_path).expect("open vd golden")));
         golden.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = golden.read_info().expect("vd golden header");
-        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut buf).expect("vd golden frame");
         buf.truncate(info.buffer_size());
         assert_eq!(

@@ -6,7 +6,6 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_SIMCONNECT").is_some() {
         println!("cargo:rustc-link-lib=advapi32");
         println!("cargo:rustc-link-lib=user32");
-        println!("cargo:rustc-link-lib=shell32");
         println!("cargo:rustc-link-lib=ws2_32");
         println!("cargo:rustc-link-lib=shlwapi");
     }
