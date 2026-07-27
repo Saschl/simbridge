@@ -6,9 +6,39 @@ description = "CPU-only Rust rewrite of the SimBridge terrain module (Terrain on
 license = "GPL-3.0"
 publish = false
 
+# keep `cargo bench` pointed at the real benches only — the default libtest
+# harness on lib/bins rejects the benches' custom flags (e.g. `-- --quick`)
+[lib]
+bench = false
+
 [[bin]]
 name = "terrain-service"
 path = "src/main.rs"
+bench = false
+
+[[bin]]
+name = "render_scene"
+path = "src/bin/render_scene.rs"
+bench = false
+
+[[bin]]
+name = "terraindump"
+path = "src/bin/terraindump.rs"
+bench = false
+
+# Self-contained A/B and profiling benches (no criterion, no dev-deps); see
+# benches/README.md. Run with: cargo bench --no-default-features
+[[bench]]
+name = "nd_render_ab"
+harness = false
+
+[[bench]]
+name = "nd_cycle"
+harness = false
+
+[[bench]]
+name = "extract_ab"
+harness = false
 
 [features]
 # SimConnect requires the MSFS SDK (and libclang) at build time; disable for
