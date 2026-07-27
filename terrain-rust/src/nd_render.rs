@@ -9,7 +9,7 @@
 use crate::fileformat::{ELEV_INVALID, ELEV_UNKNOWN, ELEV_WATER};
 use crate::geodesy::distance_wgs84;
 use crate::jsmath::js_round;
-use crate::patterns::{pattern_value, PRIME_HIGH_DENSITY, PRIME_LOW_DENSITY, PRIME_WATER};
+use crate::patterns::{PATTERN_WIDTH, PRIME_HIGH_DENSITY, PRIME_LOW_DENSITY, PRIME_WATER};
 use crate::state::NdMapGeometry;
 use crate::statistics::{HISTOGRAM_BIN_COUNT, HISTOGRAM_BIN_RANGE, HISTOGRAM_MIN_ELEVATION};
 use crate::worldmap::WorldMap;
@@ -233,6 +233,173 @@ fn density_pixel(pattern: u8, prime: u8, color: [u8; 4]) -> [u8; 4] {
     }
 }
 
+/// Colour band an aligned 8x8 block falls into. The band depends only on the
+/// block's elevation, never on the pattern, so it is decided once per block
+/// instead of once per pixel; the density pattern is applied afterwards via
+/// [`BandColors`].
+///
+/// Both display modes draw from this one set: peaks mode never yields the
+/// red/yellow bands and normal mode never yields `SolidGreen`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Band {
+    Black = 0,
+    Water = 1,
+    Unknown = 2,
+    HighRed = 3,
+    HighYellow = 4,
+    HighGreen = 5,
+    LowYellow = 6,
+    LowGreen = 7,
+    SolidGreen = 8,
+}
+
+const BANDS: [Band; 9] = [
+    Band::Black,
+    Band::Water,
+    Band::Unknown,
+    Band::HighRed,
+    Band::HighYellow,
+    Band::HighGreen,
+    Band::LowYellow,
+    Band::LowGreen,
+    Band::SolidGreen,
+];
+
+/// The colour a band assigns to each of the 256 possible pattern values.
+///
+/// Pattern value 0 means "never active" and resolves to `COLOR_DISABLED` ahead
+/// of the density test — 0 is divisible by every prime, so it cannot be left
+/// to [`density_pixel`].
+type BandColors = [[u8; 4]; 256];
+
+fn band_colors(band: Band) -> BandColors {
+    let mut colors = [COLOR_DISABLED; 256];
+    for (value, color) in colors.iter_mut().enumerate().skip(1) {
+        let value = value as u8;
+        *color = match band {
+            Band::Black => COLOR_BLACK,
+            Band::Water => density_pixel(value, PRIME_WATER, COLOR_WATER),
+            Band::Unknown => density_pixel(value, PRIME_HIGH_DENSITY, COLOR_UNKNOWN),
+            Band::HighRed => density_pixel(value, PRIME_HIGH_DENSITY, COLOR_RED),
+            Band::HighYellow => density_pixel(value, PRIME_HIGH_DENSITY, COLOR_YELLOW),
+            Band::HighGreen => density_pixel(value, PRIME_HIGH_DENSITY, COLOR_GREEN),
+            Band::LowYellow => density_pixel(value, PRIME_LOW_DENSITY, COLOR_YELLOW),
+            Band::LowGreen => density_pixel(value, PRIME_LOW_DENSITY, COLOR_GREEN),
+            Band::SolidGreen => COLOR_GREEN,
+        };
+    }
+    colors
+}
+
+/// Colour tables for every band, indexed by the band's discriminant.
+fn band_table() -> [BandColors; BANDS.len()] {
+    let mut table = [[COLOR_DISABLED; 256]; BANDS.len()];
+    for (index, &band) in BANDS.iter().enumerate() {
+        debug_assert_eq!(index, band as usize, "BANDS must follow the discriminants");
+        table[index] = band_colors(band);
+    }
+    table
+}
+
+/// The seed an empty/fully-invalid block keeps, unchanged from the TS kernel.
+/// It doubles as the substitute for `ELEV_INVALID` in the maximum: the seed is
+/// also the floor, so anything mapped onto it is indistinguishable from an
+/// elevation that lost the comparison anyway.
+const BLOCK_EMPTY: i16 = -1000;
+
+/// Highest elevation per aligned 8x8 patch, emulating the lower resolution of
+/// the real system.
+///
+/// Only `ELEV_INVALID` is excluded, so Unknown/Water can still win the maximum
+/// (matching the kernel). Mapping Invalid onto the `BLOCK_EMPTY` seed turns
+/// that guard into a select, which lets the row-wise maximum vectorise; the
+/// result is unchanged, since a value mapped to the seed could never have
+/// beaten it anyway.
+///
+/// Reducing whole rows first (rather than 8x8 patch by patch) is what makes
+/// the elementwise maximum a straight `i16` vector op. Classifying the maxima
+/// into bands is left to the caller on purpose: an opaque call in the loop
+/// below it is enough to stop LLVM vectorising this one.
+#[inline(never)]
+fn block_maxima(
+    elevations: &[i16],
+    width: usize,
+    height: usize,
+    blocks_x: usize,
+    blocks_y: usize,
+) -> Vec<i16> {
+    let mut maxima = vec![BLOCK_EMPTY; blocks_x * blocks_y];
+    let mut row_max = vec![BLOCK_EMPTY; width];
+
+    for by in 0..blocks_y {
+        row_max.fill(BLOCK_EMPTY);
+        for y in by * 8..((by + 1) * 8).min(height) {
+            let row = &elevations[y * width..(y + 1) * width];
+            for (max, &elevation) in row_max.iter_mut().zip(row) {
+                let elevation = if elevation == ELEV_INVALID { BLOCK_EMPTY } else { elevation };
+                *max = if elevation > *max { elevation } else { *max };
+            }
+        }
+
+        let block_row = &mut maxima[by * blocks_x..(by + 1) * blocks_x];
+        for (slot, block) in block_row.iter_mut().zip(row_max.chunks(8)) {
+            let mut max = BLOCK_EMPTY;
+            for &elevation in block {
+                max = if elevation > max { elevation } else { max };
+            }
+            *slot = max;
+        }
+    }
+
+    maxima
+}
+
+/// Paints the RGBA frame from the per-block bands: one pattern byte and one
+/// table lookup per pixel.
+///
+/// Kept separate from [`block_maxima`] deliberately — merging the two passes
+/// into one function makes LLVM spill the colour tables and costs ~2x, so the
+/// split is load-bearing rather than cosmetic.
+#[inline(never)]
+fn paint_frame(
+    bands: &[Band],
+    blocks_x: usize,
+    pattern: &[u8],
+    table: &[BandColors],
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let mut frame = vec![0u8; width * height * 4];
+
+    for (y, frame_row) in frame.chunks_exact_mut(width * 4).enumerate() {
+        // rows past the end of the zero-padded pattern texture read as 0
+        let start = (y * PATTERN_WIDTH).min(pattern.len());
+        let active = (pattern.len() - start).min(PATTERN_WIDTH).min(width);
+        let pattern_row = &pattern[start..start + active];
+        let band_row = &bands[(y / 8) * blocks_x..(y / 8 + 1) * blocks_x];
+
+        for (bx, band) in band_row.iter().enumerate() {
+            let from = bx * 8;
+            let to = (from + 8).min(active);
+            if from >= to {
+                continue;
+            }
+            let colors = &table[*band as usize];
+            let pixels = &mut frame_row[from * 4..to * 4];
+            for (pixel, &value) in pixels.chunks_exact_mut(4).zip(&pattern_row[from..to]) {
+                pixel.copy_from_slice(&colors[value as usize]);
+            }
+        }
+
+        for pixel in frame_row[active * 4..].chunks_exact_mut(4) {
+            pixel.copy_from_slice(&COLOR_DISABLED);
+        }
+    }
+
+    frame
+}
+
 /// Renders the ND terrain map into an RGBA frame (row 0 = top of display).
 pub fn render_navigation_display(
     elevations: &[i16],
@@ -242,60 +409,34 @@ pub fn render_navigation_display(
 ) -> Vec<u8> {
     let width = geometry.width;
     let height = geometry.height;
-
-    // highest elevation per aligned 8x8 patch (ignoring Invalid only, so
-    // Unknown/Water can win the max — matches the kernel), emulating the lower
-    // resolution of the real system
     let blocks_x = width.div_ceil(8);
     let blocks_y = height.div_ceil(8);
-    let mut block_max = vec![-1000i32; blocks_x * blocks_y];
-    for by in 0..blocks_y {
-        for bx in 0..blocks_x {
-            let mut pixel_elevation = -1000i32;
-            for y in by * 8..((by + 1) * 8).min(height) {
-                for x in bx * 8..((bx + 1) * 8).min(width) {
-                    let elevation = elevations[y * width + x] as i32;
-                    if elevation > pixel_elevation && elevation != ELEV_INVALID as i32 {
-                        pixel_elevation = elevation;
-                    }
-                }
-            }
-            block_max[by * blocks_x + bx] = pixel_elevation;
-        }
-    }
 
-    let warning = normal_mode_warning_thresholds(stats);
-    let green = normal_mode_green_thresholds(stats);
-    let peaks = peaks_mode_thresholds(stats);
+    let maxima = block_maxima(elevations, width, height, blocks_x, blocks_y);
 
-    let mut frame = vec![0u8; width * height * 4];
-    for y in 0..height {
-        for x in 0..width {
-            let pattern_val = pattern_value(pattern, x, y);
-            let rgba = if pattern_val == 0 {
-                COLOR_DISABLED
-            } else {
-                let elevation = block_max[(y / 8) * blocks_x + x / 8];
-                if stats.normal_mode {
-                    render_normal_mode_pixel(elevation, pattern_val, stats, &warning, &green)
-                } else {
-                    render_peaks_mode_pixel(elevation, pattern_val, &peaks)
-                }
-            };
-            frame[(y * width + x) * 4..(y * width + x) * 4 + 4].copy_from_slice(&rgba);
-        }
-    }
+    // the band depends only on the block's elevation, so the threshold
+    // comparisons run once per 8x8 block instead of once per pixel
+    let bands: Vec<Band> = if stats.normal_mode {
+        let warning = normal_mode_warning_thresholds(stats);
+        let green = normal_mode_green_thresholds(stats);
+        maxima
+            .iter()
+            .map(|&max| normal_mode_band(max as i32, stats, &warning, &green))
+            .collect()
+    } else {
+        let peaks = peaks_mode_thresholds(stats);
+        maxima.iter().map(|&max| peaks_mode_band(max as i32, &peaks)).collect()
+    };
 
-    frame
+    paint_frame(&bands, blocks_x, pattern, &band_table(), width, height)
 }
 
-fn render_normal_mode_pixel(
+fn normal_mode_band(
     elevation: i32,
-    pattern_val: u8,
     stats: &RenderStats,
     warning: &(f64, f64, f64),
     green: &(f64, f64),
-) -> [u8; 4] {
+) -> Band {
     let (low_density_yellow, high_density_yellow, high_density_red) = *warning;
     let (low_density_green, high_density_green) = *green;
     let e = elevation as f64;
@@ -306,30 +447,30 @@ fn render_normal_mode_pixel(
         && e >= stats.cut_off_altitude
     {
         if e >= high_density_red {
-            return density_pixel(pattern_val, PRIME_HIGH_DENSITY, COLOR_RED);
+            return Band::HighRed;
         }
         if e >= high_density_yellow {
-            return density_pixel(pattern_val, PRIME_HIGH_DENSITY, COLOR_YELLOW);
+            return Band::HighYellow;
         }
         if e >= high_density_green && e < low_density_yellow {
-            return density_pixel(pattern_val, PRIME_HIGH_DENSITY, COLOR_GREEN);
+            return Band::HighGreen;
         }
         if e >= low_density_yellow && e < high_density_yellow {
-            return density_pixel(pattern_val, PRIME_LOW_DENSITY, COLOR_YELLOW);
+            return Band::LowYellow;
         }
         if e >= low_density_green && e < high_density_green {
-            return density_pixel(pattern_val, PRIME_LOW_DENSITY, COLOR_GREEN);
+            return Band::LowGreen;
         }
     } else if elevation == ELEV_WATER as i32 {
-        return density_pixel(pattern_val, PRIME_WATER, COLOR_WATER);
+        return Band::Water;
     } else if elevation == ELEV_UNKNOWN as i32 {
-        return density_pixel(pattern_val, PRIME_HIGH_DENSITY, COLOR_UNKNOWN);
+        return Band::Unknown;
     }
 
-    COLOR_BLACK
+    Band::Black
 }
 
-fn render_peaks_mode_pixel(elevation: i32, pattern_val: u8, peaks: &(f64, f64, f64)) -> [u8; 4] {
+fn peaks_mode_band(elevation: i32, peaks: &(f64, f64, f64)) -> Band {
     let (lower_density, higher_density, solid_density) = *peaks;
     let e = elevation as f64;
 
@@ -338,21 +479,21 @@ fn render_peaks_mode_pixel(elevation: i32, pattern_val: u8, peaks: &(f64, f64, f
         && elevation != ELEV_WATER as i32
     {
         if solid_density <= e {
-            return COLOR_GREEN;
+            return Band::SolidGreen;
         }
         if higher_density <= e {
-            return density_pixel(pattern_val, PRIME_HIGH_DENSITY, COLOR_GREEN);
+            return Band::HighGreen;
         }
         if lower_density <= e {
-            return density_pixel(pattern_val, PRIME_LOW_DENSITY, COLOR_GREEN);
+            return Band::LowGreen;
         }
     } else if elevation == ELEV_WATER as i32 {
-        return density_pixel(pattern_val, PRIME_WATER, COLOR_WATER);
+        return Band::Water;
     } else if elevation == ELEV_UNKNOWN as i32 {
-        return density_pixel(pattern_val, PRIME_HIGH_DENSITY, COLOR_UNKNOWN);
+        return Band::Unknown;
     }
 
-    COLOR_BLACK
+    Band::Black
 }
 
 /// Threshold metadata (`analyzeMetadata`), computed straight from the stats.
