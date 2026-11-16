@@ -30,7 +30,6 @@ import {
 } from './generic/constants';
 import { Logger } from './logging/logger';
 import { ThreadLogger } from './logging/threadlogger';
-import { startGpuMemoryLogging } from './logging/gpumemory';
 import { MapHandler } from './maphandler';
 import { NavigationDisplayRenderer } from './navigationdisplayrenderer';
 import { VerticalDisplayRenderer } from './verticaldisplayrenderer';
@@ -62,8 +61,6 @@ class TerrainWorker {
   private gpu: GPU = null;
 
   private mapHandler: MapHandler = null;
-
-  private stopGpuMemoryLogging: () => void = () => undefined;
 
   private displayDimension: {
     width: number;
@@ -268,7 +265,6 @@ class TerrainWorker {
 
     /* create the map handler */
     this.mapHandler = new MapHandler(this.logging, this.gpu);
-    this.stopGpuMemoryLogging = startGpuMemoryLogging(this.logging, () => this.mapHandler.memoryUsage());
 
     /* create the sides */
     this.displayRendering.L = {
@@ -410,7 +406,6 @@ class TerrainWorker {
   }
 
   public shutdown(): void {
-    this.stopGpuMemoryLogging();
     this.stopRendering();
 
     if (this.displayRendering.L.navigationDisplay !== null) this.displayRendering.L.navigationDisplay.shutdown();
