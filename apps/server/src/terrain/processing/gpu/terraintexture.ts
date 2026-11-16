@@ -1,4 +1,6 @@
 import { CPUKernel, GPU, IKernelRunShortcut, Texture } from 'gpu.js';
+import { InvalidElevation, UnknownElevation, WaterElevation } from '../generic/constants';
+import { decodeTerrainElevation, readPackedTerrainElevation } from './terrainsampling';
 
 export type TerrainElevationData = Texture | Float32Array[];
 
@@ -12,9 +14,21 @@ interface PackedTexture extends Texture {
 }
 
 /**
- * Owns one RGBA8 texture containing two signed 16-bit elevations per texel.
- * GPU consumers must decode the normalized byte channels with decodeTerrainElevation;
- * CPU consumers receive ordinary elevation rows. No full-size upload copy is retained.
+ * Keeps a terrain map on the GPU at 2 bytes per elevation instead of a 4-byte float.
+ *
+ * Elevations are whole numbers, so each one is stored as the two bytes of an Int16
+ * (two elevations per RGBA8 texel). GPU.js still hands kernels every byte as its own
+ * number between 0 and 1, so they rebuild the value with decodeTerrainElevation.
+ * Example for 1904 m:
+ *   stored bytes  112, 7          (1904 = 112 + 7 * 256)
+ *   kernel reads  0.439, 0.027    (112 / 255, 7 / 255)
+ *   decoded       112 + 7 * 256 = 1904
+ *
+ * GPU.js has no supported way to store data like this. This class takes the texture
+ * of a tiny kernel, replaces its storage through WebGL and overwrites its size fields.
+ * Because that relies on GPU.js internals, gpu.js is pinned to an exact version in
+ * package.json and MapHandler runs verifyPackedTerrain at startup. There is no
+ * fallback on purpose: if that check fails, terrain stays off until this is fixed.
  */
 export class TerrainTexture {
   private owner: IKernelRunShortcut = null;
@@ -44,14 +58,6 @@ export class TerrainTexture {
       return Array.from({ length: height }, (_, y) => Float32Array.from(data.subarray(y * width, (y + 1) * width)));
     }
 
-    const gl = this.gpu.context as WebGLRenderingContext;
-    const pixelCount = Math.ceil(data.length / 2);
-    const textureWidth = Math.ceil(Math.sqrt(pixelCount));
-    const textureHeight = Math.ceil(pixelCount / textureWidth);
-    if (Math.max(textureWidth, textureHeight) > gl.getParameter(gl.MAX_TEXTURE_SIZE)) {
-      throw new Error('Terrain texture exceeds the GPU texture size limit');
-    }
-
     if (!this.owner) {
       // Let GPU.js own a packed 2D Texture for sampling and destruction.
       // Run this tiny, argument-free kernel only once; later uploads write its
@@ -76,6 +82,14 @@ export class TerrainTexture {
     }
 
     const texture = this.texture;
+    const gl = texture.context;
+    const pixelCount = Math.ceil(data.length / 2);
+    const textureWidth = Math.ceil(Math.sqrt(pixelCount));
+    const textureHeight = Math.ceil(pixelCount / textureWidth);
+    if (Math.max(textureWidth, textureHeight) > gl.getParameter(gl.MAX_TEXTURE_SIZE)) {
+      throw new Error('Terrain texture exceeds the GPU texture size limit');
+    }
+
     const previousBinding = gl.getParameter(gl.TEXTURE_BINDING_2D);
     const previousFlip = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL);
     try {
@@ -122,5 +136,47 @@ export class TerrainTexture {
     this.owner = null;
     this.texture = null;
     this.storageSize = [0, 0];
+  }
+}
+
+/**
+ * Proves the packed layout on this GPU and GPU.js build: uploads known elevations
+ * and reads them back through a kernel that indexes and decodes them the way the
+ * terrain kernels do. Throws on the first difference.
+ */
+export function verifyPackedTerrain(gpu: GPU): void {
+  const texture = new TerrainTexture(gpu);
+  let reader = gpu
+    .createKernel(readPackedTerrainElevation, {
+      dynamicArguments: true,
+      dynamicOutput: true,
+      precision: 'single',
+      optimizeFloatMemory: true,
+    })
+    .setFunctions([decodeTerrainElevation]);
+  try {
+    // The second upload re-specifies an existing texture, as every map rebuild does.
+    // Odd sample counts leave a half-filled texel and a partial last texture row.
+    for (const [width, height] of [
+      [37, 21],
+      [251, 127],
+    ]) {
+      const expected = new Int16Array(width * height);
+      // 7919 is coprime to 65536: every sample differs, so misplaced reads show up.
+      for (let i = 0; i < expected.length; i++) expected[i] = ((i * 7919) % 65536) - 32768;
+      expected.set([InvalidElevation, UnknownElevation, WaterElevation, 0, -32768]);
+
+      reader = reader.setOutput([width, height]);
+      const rows = reader(texture.upload(expected, width, height)) as Float32Array[];
+      for (let i = 0; i < expected.length; i++) {
+        const actual = rows[Math.floor(i / width)][i % width];
+        if (actual !== expected[i]) {
+          throw new Error(`sample ${i} of ${width}x${height} read back as ${actual} instead of ${expected[i]}`);
+        }
+      }
+    }
+  } finally {
+    reader.destroy();
+    texture.reset();
   }
 }

@@ -39,8 +39,6 @@ $ npm run install:exec
 
 The Windows executable is packaged with `@yao-pkg/pkg` in Node SEA mode. The build embeds the Node 26 runtime and application dependencies, then applies the FlyByWire icon and the version from `package.json`.
 
-Set `SIMBRIDGE_PORT` to override the configured server port for one process, for example when testing a packaged build alongside the development server.
-
 Distribute the complete `build/` folder, including `node_modules/`, `resources/`, `terrain/`, and the versioned tray-helper directory, alongside `fbw-simbridge.exe`. PDF.js workers, decoder assets, the tray helper, and the terrain database are loaded from that folder. Node.js is not required on the destination machine.
 
 ## Documentation

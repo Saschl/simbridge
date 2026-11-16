@@ -21,7 +21,7 @@ import { createElevationProfile } from './gpu/elevationprofile';
 import { bearingWgs84, normalizeHeading, projectWgs84, wgs84toPixelCoordinate } from './gpu/helper';
 import { ElevationProfileConstants, LocalElevationMapConstants } from './gpu/interfaces';
 import { decodeTerrainElevation } from './gpu/terrainsampling';
-import { TerrainElevationData, TerrainTexture } from './gpu/terraintexture';
+import { TerrainElevationData, TerrainTexture, verifyPackedTerrain } from './gpu/terraintexture';
 import { Logger } from './logging/logger';
 import {
   containsTerrainBounds,
@@ -121,6 +121,7 @@ export class MapHandler {
   }
 
   private createKernels(): void {
+    const packedTerrain = this.gpu.Kernel !== CPUKernel;
     this.terrainTexture = new TerrainTexture(this.gpu);
     this.detailTexture = new TerrainTexture(this.gpu);
 
@@ -138,7 +139,7 @@ export class MapHandler {
       .setConstants<LocalElevationMapConstants>({
         unknownElevation: UnknownElevation,
         invalidElevation: InvalidElevation,
-        packedTerrain: this.gpu.Kernel !== CPUKernel,
+        packedTerrain,
       })
       .setFunctions([
         deg2rad,
@@ -163,7 +164,7 @@ export class MapHandler {
       .setConstants<ElevationProfileConstants>({
         unknownElevation: UnknownElevation,
         invalidElevation: InvalidElevation,
-        packedTerrain: this.gpu.Kernel !== CPUKernel,
+        packedTerrain,
       })
       .setFunctions([
         deg2rad,
@@ -218,6 +219,13 @@ export class MapHandler {
   public async initialize(): Promise<boolean> {
     return this.readTerrainMap().then((terrainmap) => {
       this.worldmap = new Worldmap(terrainmap);
+
+      try {
+        verifyPackedTerrain(this.gpu);
+      } catch (error) {
+        this.logging.error(`Terrain is disabled: packed terrain textures failed their self-test (${error})`);
+        return false;
+      }
 
       this.createKernels();
 
