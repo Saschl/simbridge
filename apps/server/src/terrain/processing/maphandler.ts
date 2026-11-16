@@ -207,6 +207,14 @@ export class MapHandler {
     if (this.extractElevationProfile !== null) this.extractElevationProfile.destroy();
   }
 
+  public memoryUsage(): { coarseBytes: number; detailBytes: number; cpuCacheBytes: number } {
+    return {
+      coarseBytes: this.terrainTexture?.allocatedBytes ?? 0,
+      detailBytes: this.detailTexture?.allocatedBytes ?? 0,
+      cpuCacheBytes: this.cachedElevationData.cpuData?.byteLength ?? 0,
+    };
+  }
+
   public async initialize(): Promise<boolean> {
     return this.readTerrainMap().then((terrainmap) => {
       this.worldmap = new Worldmap(terrainmap);

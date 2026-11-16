@@ -25,6 +25,11 @@ export class TerrainTexture {
 
   constructor(private readonly gpu: GPU) {}
 
+  /** RGBA8 storage requested from GL, including padding; excludes driver overhead. */
+  public get allocatedBytes(): number {
+    return this.storageSize[0] * this.storageSize[1] * 4;
+  }
+
   public upload(data: Int16Array, width: number, height: number): TerrainElevationData {
     if (
       !Number.isInteger(width) ||
